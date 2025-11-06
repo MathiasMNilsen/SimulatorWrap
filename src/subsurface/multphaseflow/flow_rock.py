@@ -1,7 +1,7 @@
 """Descriptive description."""
 from selectors import SelectSelector
 
-from simulator.opm import flow
+from subsurface.multphaseflow.opm import flow
 from importlib import import_module
 import datetime as dt
 import numpy as np

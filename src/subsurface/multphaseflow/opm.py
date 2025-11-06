@@ -8,7 +8,7 @@ import time
 from datetime import timedelta
 
 # Internal imports
-from simulator.eclipse import eclipse
+from subsurface.multphaseflow.eclipse import eclipse
 from misc.system_tools.environ_var import OPMRunEnvironment
 
 
