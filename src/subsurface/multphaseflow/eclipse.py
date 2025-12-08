@@ -47,7 +47,9 @@ class eclipse:
                     - sim_path: Path to the simulator
                     - sim_flag: Flags sent to the simulator (see simulator documentation for all possibilities)
                 - sim_limit: maximum number of seconds a simulation can run before being killed
-                - mem_req: estimated memory requirement (Gigabyte) used when running a job on a hpc
+                - mem: estimated memory requirement (Gigabyte) used when running a job on a hpc
+                - python_ver: specify the python version to use when running on a hpc
+                - opm_ver: specify the OPM version to use when running on a hpc
                 - runfile: name of the simulation input file
                 - reportpoint: these are the dates the simulator reports results
                 - reporttype: this key states that the report poins are given as dates
@@ -129,8 +131,14 @@ class eclipse:
         if 'sim_limit' in self.input_dict:
             self.options['sim_limit'] = self.input_dict['sim_limit']
 
-        if 'mem_req' in self.input_dict:
-            self.options['mem_req'] = self.input_dict['mem_req']
+        if 'mem' in self.input_dict:
+            self.options['mem'] = self.input_dict['mem']
+
+        if 'python_ver' in self.input_dict:
+            self.options['python_ver'] = self.input_dict['python_ver']
+
+        if 'opm_ver' in self.input_dict:
+            self.options['opm_ver'] = self.input_dict['opm_ver']
             
         if 'reportdates' in self.input_dict:
             self.reportdates = [

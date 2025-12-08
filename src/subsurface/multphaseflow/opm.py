@@ -117,7 +117,13 @@ class flow(eclipse):
         sim_limit_str = f'--time={str(timedelta(seconds=sim_limit))}' if sim_limit is not None else "--time=01:00:00"
 
         # extract estimated memory requirement (Gigabyte) for a job
-        mem_req = str(kwargs.get("mem_req", 4))
+        mem = str(kwargs.get("mem", "4G"))
+
+        # extract opm simulator version
+        opm_ver = kwargs.get("opm_ver", "") # e.g., "/2025.04-foss-2024a" (remember the leading /)
+
+        # extract Python version
+        python_ver = kwargs.get("python_ver", "") # e.g., "/3.12.3-GCCcore-13.3.0" (remember the leading /)
         
         diff_ne = n_e[-1] - n_e[0]
 
@@ -126,16 +132,16 @@ class flow(eclipse):
 #SBATCH --job-name=EnDA                                                                               
 #SBATCH --array=0-{diff_ne}                                                                            
 #SBATCH {sim_limit_str}                                                                                   
-#SBATCH --mem={mem_req}G
+#SBATCH --mem={mem}
 #SBATCH --ntasks={n_tasks}                                                                                          
 #SBATCH --cpus-per-task=2                                                                                 
 #SBATCH --export=ALL                                                                                      
 #SBATCH --output=/dev/null                                                                                
 
 # OPTIONAL: load modules here                                                                             
-module load Python                                                                                        
+module load Python{python_ver}                                                                                        
 export LMOD_DISABLE_SAME_NAME_AUTOSWAP=no                                                                 
-module load opm-simulators                                                                                
+module load opm-simulators{opm_ver}                                                                                
 
 source {venv}                                                                    
 
