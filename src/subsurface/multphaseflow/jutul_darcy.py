@@ -23,10 +23,10 @@ __all__ = ['JutulDarcyWrapper']
 
 #────────────────────────────────────────────────────────────────────────────────────
 os.environ['PYTHON_JULIACALL_HANDLE_SIGNALS'] = 'yes'
-os.environ['PYTHON_JULIACALL_THREADS'] = 'auto'
+os.environ['PYTHON_JULIACALL_THREADS'] = '1'
 os.environ['PYTHON_JULIACALL_OPTLEVEL'] = '3'
 warnings.filterwarnings('ignore', message='.*juliacall module already imported.*')
-#────────────────────────────────────────────────────────────────────────────────────
+#────────────────────────────────────────────────────────────────────── ──────────────
 
 
 class JutulDarcyWrapper:
@@ -69,7 +69,9 @@ class JutulDarcyWrapper:
         self.out_format = options.get('out_format', 'list')
         self.datatype   = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
         self.parallel   = options.get('parallel', 1)
-        self.platform   = options.get('platform', 'Python')
+        self.platform   = options.get('platform', 'Julia')
+        self.units      = options.get('units', 'si')
+
         self.datafile   = None
         self.compute_adjoint = False
 
@@ -141,7 +143,7 @@ class JutulDarcyWrapper:
             pyres = simulate_data_file(
                 data_file_name=self.datafile, 
                 convert=True, # Convert to output dictionary
-                units='si',   # Use SI units (Sm3 and so on)
+                units=self.units, 
                 info_level=-1 # No terminal output
             )
         elif self.platform == 'Julia':
@@ -151,7 +153,8 @@ class JutulDarcyWrapper:
 
             case  = jl.setup_case_from_data_file(self.datafile)
             jlres = jl.simulate_reservoir(case, info_level=-1)
-            pyres = convert_to_pydict(jlres, case, units='si')
+            #jlres = jl.simulate_reservoir(case)
+            pyres = convert_to_pydict(jlres, case, units=self.units)
 
             # TODO: Make sure the gradient computation works (this example is hardcoded, for a specific case)
             if self.compute_adjoint:
