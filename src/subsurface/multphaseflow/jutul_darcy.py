@@ -14,6 +14,8 @@ import os
 
 from mako.template import Template
 from typing import Union
+from p_tqdm import p_map
+from tqdm import tqdm
 #────────────────────────────────────────────────────
 
 
@@ -27,6 +29,13 @@ os.environ['PYTHON_JULIACALL_THREADS'] = '1'
 os.environ['PYTHON_JULIACALL_OPTLEVEL'] = '3'
 warnings.filterwarnings('ignore', message='.*juliacall module already imported.*')
 #────────────────────────────────────────────────────────────────────── ──────────────
+
+PBAR_OPTS = {
+    'ncols': 110,
+    'colour': "#285475",
+    'bar_format': '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+    'ascii': '-◼', # Custom bar characters for a sleeker look
+}
 
 
 class JutulDarcyWrapper:
@@ -45,12 +54,11 @@ class JutulDarcyWrapper:
                 - 'out_format': Output format ('list', 'dict', 'dataframe'; default: 'list').
                 - 'datatype': List of data types to extract (default: ['FOPT', 'FGPT', 'FWPT', 'FWIT']).
                 - 'parallel': Number of parallel simulations (default: 1).
-                - 'platform': 'Python' or 'Julia' (default: 'Python').
 
         References
         ----------
         [1] Møyner, O. (2025).
-            JutulDarcy.jl – a fully differentiable high-performance reservoir simulator
+            JutulDarcy.jl - a fully differentiable high-performance reservoir simulator
             based on automatic differentiation. Computational Geosciences, 29, Article 30.
             https://doi.org/10.1007/s10596-025-10366-6
         '''
@@ -69,41 +77,80 @@ class JutulDarcyWrapper:
         self.out_format = options.get('out_format', 'list')
         self.datatype   = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
         self.parallel   = options.get('parallel', 1)
-        self.platform   = options.get('platform', 'Julia')
-        self.units      = options.get('units', 'si')
+        self.units      = options.get('units', 'metric') # This is not consistently used!
 
-        self.datafile   = None
-        self.compute_adjoint = False
+        self.datafile = None
+        self.compute_adjoints = False
 
         # This is for PET to work properly (should be removed in future versions)
         self.input_dict = options
         self.true_order = [self.reporttype, options['reportpoint']]
+        self.steps = [i+1 for i in range(len(self.true_order[1]))]
 
-        # Adjoint information
-        if 'well_adjoint_info' in options:
-            self.compute_adjoint = True
-            self.adjoint_info = {'wells': {}}
+        # Adjoint settings
+        #---------------------------------------------------------------------------------------------------------
+        if 'adjoints' in options:
+            self.compute_adjoints = True
+            self.adjoint_info = {}
+    
+            for datatype in options['adjoints']:
 
-            for well_id, well_info in options['well_adjoint_info'].items():
-                well_obj = well_info['objective']
-                well_var = well_info['variable']
-
-                if isinstance(well_obj, str):
-                    well_obj = [well_obj]
-                if isinstance(well_var, str):
-                    well_var = [well_var]
-
-                for obj in well_obj:
-                    if not obj in ['mass', 'liquid', 'water', 'oil', 'gas', 'rate']:
-                        raise ValueError(f'Adjoint objective {obj} not supported')
-                    
-                self.adjoint_info['wells'][well_id] = {
-                    'objective': well_obj,
-                    'variable': well_var
-                }
+                # Check that datatype is supported
+                if not datatype in ['mass', 'liquid', 'water', 'oil', 'gas', 'rate']:
+                    raise ValueError(f'Adjoint objective {datatype} not supported')
                 
+                well_id = options['adjoints'][datatype]['well_id']
+                param = options['adjoints'][datatype]['param']
+                unit  = options['adjoints'][datatype]['unit']
+                steps = options['adjoints'][datatype].get('steps', 'all')
 
-    def run_fwd_sim(self, input: dict, idn: int=0, delete_folder: bool=True) -> Union[dict|list|pd.DataFrame]:
+                if steps == 'acc':
+                    steps = None
+                elif steps == 'all':
+                    steps = self.steps
+                elif isinstance(steps, int):
+                    steps = [steps]
+
+                if not isinstance(well_id, list):
+                    well_id = [well_id]
+                if not isinstance(param, list):
+                    param = [param]
+
+                for wid in well_id:
+                    self.adjoint_info[f'{datatype}:{wid}'] = {
+                        'datatype': datatype,
+                        'well_id': wid,
+                        'param': param,
+                        'unit': unit,
+                        'steps': steps
+                    }
+        #---------------------------------------------------------------------------------------------------------
+
+    def __call__(self, inputs: dict):
+
+        # Delet all existing En_* folders
+        for item in os.listdir('.'):
+            if os.path.isdir(item) and item.startswith('En_'):
+                shutil.rmtree(item)
+        
+        # simulate all inputs in parallel
+        outputs = p_map(
+            self.run_fwd_sim, 
+            [inputs[n] for n in range(len(inputs))], 
+            list(range(len(inputs))), 
+            num_cpus=self.parallel,
+            unit='sim',
+            **PBAR_OPTS
+        )
+
+        if self.compute_adjoints:
+            results, adjoints = zip(*outputs)
+            return results, adjoints
+        else:
+            return outputs
+                     
+
+    def run_fwd_sim(self, input: dict, idn: int=0, delete_folder: bool=True):
         '''
         Run forward simulation for given input parameters.
 
@@ -137,66 +184,92 @@ class JutulDarcyWrapper:
         # Enter simulation folder and run simulation
         os.chdir(folder)
 
-        if self.platform == 'Python':
-            # Needs to be imported here for multiprocessing to work
-            from jutuldarcy import simulate_data_file
-            pyres = simulate_data_file(
-                data_file_name=self.datafile, 
-                convert=True, # Convert to output dictionary
-                units=self.units, 
-                info_level=-1 # No terminal output
+        from juliacall import Main as jl
+        from jutuldarcy import convert_to_pydict
+        jl.seval("using JutulDarcy, Jutul")
+
+        # Setup case
+        case = jl.setup_case_from_data_file(self.datafile)
+
+        # Get some grid info
+        nx = case.input_data["GRID"]["cartDims"][0]
+        ny = case.input_data["GRID"]["cartDims"][1]  
+        nz = case.input_data["GRID"]["cartDims"][2]
+        grid = (nx, ny, nz)
+        actnum = np.array(case.input_data["GRID"]["ACTNUM"]) # Shape (nx, ny, nz)
+        actnum_vec = actnum.flatten(order='F')  # Fortran order flattening
+
+        # Simulate and get results
+        jlres = jl.simulate_reservoir(case, info_level=-1)
+        pyres = convert_to_pydict(jlres, case, units=self.units)
+
+        if self.compute_adjoints:
+            adjoints = {key: {} for key in self.adjoint_info}
+
+            pbar = tqdm(
+                adjoints.keys(), 
+                desc=f'Solving adjoints for En_{idn}',
+                position=idn+1,
+                leave=False,
+                unit='obj',
+                dynamic_ncols=False,
+                **PBAR_OPTS
             )
-        elif self.platform == 'Julia':
-            from juliacall import Main as jl
-            from jutuldarcy import convert_to_pydict
-            jl.seval("using JutulDarcy, Jutul")
+            
+            for key in adjoints:
+                #datatype, well_id, param, unit = self.adjoint_info[key]
+                info = self.adjoint_info[key]
 
-            case  = jl.setup_case_from_data_file(self.datafile)
-            jlres = jl.simulate_reservoir(case, info_level=-1)
-            #jlres = jl.simulate_reservoir(case)
-            pyres = convert_to_pydict(jlres, case, units=self.units)
+                if info['unit'] == 'rate':
+                    rate = True
+                elif info['unit'] == 'volume':
+                    rate = False
+                else:
+                    raise ValueError(f'Unknown unit type: {info["unit"]}')
 
-            # TODO: Make sure the gradient computation works (this example is hardcoded, for a specific case)
-            if self.compute_adjoint:
+                func = get_well_objective(
+                    info['well_id'], 
+                    info['datatype'], 
+                    info['steps'], 
+                    rate=rate, 
+                    jl_import=jl
+                )
 
-                # TODO: There might be a better way of structuring the gradient info (this is very preliminary)!
-                gradients = {}
-                for well_id, well_info in self.adjoint_info['wells'].items():
-                    gradients[well_id] = {}
-                    for obj in well_info['objective']:
-                        for var in well_info['variable']:
-
-                            # Define objective function
-                            obj_func = self.well_volume_objective(
-                                well_id=well_id, 
-                                phase=obj, 
-                                jl_import=jl
-                            )
-
-                            # Compute gradients
-                            obj_grad = jl.JutulDarcy.reservoir_sensitivities(
-                                case, 
-                                jlres, 
-                                obj_func,
-                                include_parameters=True,
-                            )
-                            print(self.symdict_to_pydict(obj_grad.data, jl).keys())
-
-                            # Select relevant gradients
-                            if var == 'poro':
-                                poro_grad = np.array(obj_grad[jl.Symbol("porosity")])
-                                gradients[well_id][f'{obj}_of_poro'] = poro_grad
-                            
-                            perm_grad = np.array(obj_grad[jl.Symbol("permeability")])
-                            if var == 'permx':
-                                gradients[well_id][f'{obj}_of_permx'] = perm_grad[0]
-                            if var == 'permy':
-                                gradients[well_id][f'{obj}_of_permy'] = perm_grad[1]
-                            if var == 'permz':
-                                gradients[well_id][f'{obj}_of_permz'] = perm_grad[2]
+                # Define objective function
+                func = func if isinstance(func, list) else [func]
+                grad = []
+                for f in func:
+                    # Compute adjoint gradient
+                    g = jl.JutulDarcy.reservoir_sensitivities(
+                        case, 
+                        jlres, 
+                        f,
+                        include_parameters=True,
+                    )
+                    grad.append(g)
                 
-                print(gradients)
-                
+                # POROSITY
+                if 'poro' in info['param']:
+                    poro_grads = []
+                    for g in grad:
+                        poro_grad = np.array(g[jl.Symbol("porosity")])
+                        poro_grads.append(_expand_to_active_grid(poro_grad, actnum_vec, fill_value=0))
+                    adjoints[key]['poro'] = np.squeeze(np.array(poro_grads))
+
+                # PERMEABILITY
+                m2_per_mD = 9.869233e-16
+                for idx, perm_key in enumerate(['permx', 'permy', 'permz']):
+                    if perm_key in info['param']:
+                        perm_grads = []
+                        for g in grad:
+                            perm_grad = np.array(g[jl.Symbol("permeability")])[idx] * m2_per_mD
+                            perm_grads.append(_expand_to_active_grid(perm_grad, actnum_vec, fill_value=0))
+                        adjoints[key][perm_key] = np.squeeze(np.array(perm_grads))
+
+                # Update progress bar
+                pbar.update(1)
+            pbar.close()
+          
         os.chdir('..')
 
         # Delete simulation folder
@@ -204,13 +277,12 @@ class JutulDarcyWrapper:
             shutil.rmtree(folder)
 
         # Extract requested datatypes
-        output = self.extract_datatypes(pyres, out_format=self.out_format)
+        output = self.extract_datatypes(pyres, jlcase=case, out_format=self.out_format)
         
-        if self.compute_adjoint:
-            return output, gradients
+        if self.compute_adjoints:
+            return output, adjoints
         else:
             return output
-
 
     def render_makofile(self, makofile: str, folder: str, input: dict):
         '''
@@ -222,7 +294,7 @@ class JutulDarcyWrapper:
             f.write(template.render(**input))
 
 
-    def extract_datatypes(self, res: dict, out_format='list') -> Union[dict|list|pd.DataFrame]:
+    def extract_datatypes(self, res: dict, jlcase =None, out_format='list') -> Union[dict|list|pd.DataFrame]:
         '''
         Extract requested datatypes from simulation results.
 
@@ -249,6 +321,13 @@ class JutulDarcyWrapper:
             elif ':' in key or ' ' in key:
                 data_id, well_id = key.replace(':', ' ').split(' ')
                 out[orginal_key] = res['WELLS'][well_id][data_id]
+
+            elif key in [str(k) for k in jlcase.input_data["GRID"].keys()]:
+                value = jlcase.input_data["GRID"][f"{key}"]
+                try:
+                    out[orginal_key] = np.array(value)
+                except:
+                    out[orginal_key] = value
             else:
                 raise KeyError(f'Data type {key} not found in simulation results')
         
@@ -269,56 +348,174 @@ class JutulDarcyWrapper:
             df = pd.DataFrame(data=out, index=res['DAYS'])
             return df
         
+
     
-    def well_volume_objective(self, well_id, phase, jl_import):
-        '''
-        Define a well volume objective function for sensitivity analysis.
-
-        Parameters
-        ----------
-        well_id : str
-            Identifier of the well.
-        phase : str
-            Phase type for the well.
-
-        Returns
-        -------
-            jl.objective_function
-                Julia objective function for the specified well and target.
-        '''
-        #jl_import.seval('using JutulDarcy')
-
-        if phase == 'mass':
-            rate = 'TotalSurfaceMassRate'
-        elif phase == 'liquid':
-            rate = 'SurfaceLiquidRateTarget'
-        elif phase == 'water':
-            rate = 'SurfaceWaterRateTarget'
-        elif phase == 'oil':
-            rate = 'SurfaceOilRateTarget'
-        elif phase == 'gas':
-            rate = 'SurfaceGasRateTarget'
-        elif phase == 'rate':
-            rate = 'TotalRateTarget'
+def _symdict_to_pydict(symdict, jl_import):
+    '''Convert a Julia symbolic dictionary to a Python dictionary recursively.'''
+    pydict = {}
+    for key, value in symdict.items():
+        if jl_import.isa(value, jl_import.AbstractDict):
+            pydict[str(key)] = _symdict_to_pydict(value, jl_import)
         else:
-            raise ValueError(f'Unknown phase type: {phase}')
+            pydict[str(key)] = value
+    return pydict
+    
+def _expand_to_active_grid(param, active, fill_value=np.nan):
 
+    if len(param) == active.sum():
+        val = []
+        i = 0
+        for cell in active:
+            if cell == 1:
+                val.append(param[i])
+                i += 1
+            else:
+                val.append(fill_value)
+    elif len(param) == len(active):
+        val = param
+    else:
+        raise ValueError('Parameter length does not match number of active cells')
+    
+    return np.array(val)
+
+
+def get_well_objective(well_id, rate_id, step_id, rate=True, jl_import=None):
+    '''
+    Create a Julia objective function for well-based adjoint sensitivity analysis.
+
+    This function generates JutulDarcy objective functions that compute well quantities
+    of interest (QOI) for specific phases. The objective can target all timesteps,
+    specific timesteps, or a single timestep, and can return either instantaneous
+    rates or cumulative volumes.
+
+    Parameters
+    ----------
+    well_id : str
+        Identifier of the well for which to compute the objective.
+    rate_id : str
+        Phase type identifier. Supported values:
+        - 'mass': Total surface mass rate
+        - 'liquid': Surface liquid rate
+        - 'water': Surface water rate
+        - 'oil': Surface oil rate
+        - 'gas': Surface gas rate
+        - 'rate': Total volumetric rate
+    step_id : int, list, np.ndarray, or None
+        Timestep specification:
+        - None: Compute objective for all timesteps (cumulative)
+        - int: Compute objective for a single specific timestep
+        - list/array: Compute objectives for multiple specific timesteps
+    rate : bool, optional
+        If True (default), returns instantaneous rate at timestep(s).
+        If False, multiplies rate by dt for cumulative volume contribution.
+    jl_import : module, optional
+        Julia Main module from juliacall. If None, will import automatically.
+
+    Returns
+    -------
+    function or list of functions
+        - Single Julia objective function if step_id is None or int
+        - List of Julia objective functions if step_id is a list/array
+
+    Raises
+    ------
+    ValueError
+        If rate_id is not one of the supported phase types.
+
+    Examples
+    --------
+    >>> # Objective for total oil production across all timesteps
+    >>> obj = get_well_objective('PROD1', 'oil', None, rate=False)
+    
+    >>> # Objective for water rate at timestep 10
+    >>> obj = get_well_objective('INJ1', 'water', 10, rate=True)
+    
+    >>> # Objectives for gas rate at multiple timesteps
+    >>> objs = get_well_objective('PROD2', 'gas', [5, 10, 15], rate=True)
+    '''
+
+    if jl_import is None:
+        from juliacall import Main as jl_import
+        jl_import.seval('using JutulDarcy')
+
+    rate_id_map = {
+        'mass': 'TotalSurfaceMassRate',
+        'liquid': 'SurfaceLiquidRateTarget',
+        'water': 'SurfaceWaterRateTarget',
+        'oil': 'SurfaceOilRateTarget',
+        'gas': 'SurfaceGasRateTarget',
+        'rate': 'TotalRateTarget'
+    }
+    if rate_id not in rate_id_map:
+        raise ValueError(f'Unknown rate type: {rate_id}')
+    rate_id = rate_id_map[rate_id]
+
+    if rate:
+        dt = ''
+    else:
+        dt = 'dt*'
+
+    # Case 1: Sum of all timesteps
+    #-----------------------------------------------------------------------------
+    if step_id is None:
         jl_import.seval(f"""
         function objective_function(model, state, dt, step_i, forces)
-            rate = JutulDarcy.compute_well_qoi(model, state, forces, Symbol("{well_id}"), {rate})
-            return dt*rate
+            rate = JutulDarcy.compute_well_qoi(
+                model, 
+                state, 
+                forces, 
+                Symbol("{well_id}"), 
+                {rate_id}
+            )
+            return {dt}rate
         end
         """)
-
         return jl_import.objective_function
+    #-----------------------------------------------------------------------------
     
+    # Case 2: Multiple timesteps
+    #-----------------------------------------------------------------------------
+    elif isinstance(step_id, (list, np.ndarray)):
+        objective_steps = []
+        for sid in step_id:
+            jl_import.seval(f"""
+            function objective_function_{sid}(model, state, dt, step_i, forces)
+                if step_i != {sid}
+                    return 0.0
+                else
+                    rate = JutulDarcy.compute_well_qoi(
+                        model, 
+                        state, 
+                        forces, 
+                        Symbol("{well_id}"), 
+                        {rate_id}
+                    )
+                    return {dt}rate
+                end
+            end
+            """)
+            objective_steps.append(jl_import.seval(f'objective_function_{sid}'))
+        return objective_steps
+    #-----------------------------------------------------------------------------
 
-    def symdict_to_pydict(self, symdict, jl_import):
-        '''Convert a Julia symbolic dictionary to a Python dictionary recursively.'''
-        pydict = {}
-        for key, value in symdict.items():
-            if jl_import.isa(value, jl_import.AbstractDict):
-                pydict[str(key)] = self.symdict_to_pydict(value, jl_import)
-            else:
-                pydict[str(key)] = value
-        return pydict
+    # Case 3: Single timestep
+    #-----------------------------------------------------------------------------
+    else:
+        jl_import.seval(f"""
+        function objective_function(model, state, dt, step_i, forces)
+            if step_i != {step_id}
+                return 0.0
+            else
+                rate = JutulDarcy.compute_well_qoi(
+                    model, 
+                    state, 
+                    forces, 
+                    Symbol("{well_id}"), 
+                    {rate_id}
+                )
+                return {dt}rate
+            end
+        end
+        """)
+        return jl_import.objective_function
+    #-----------------------------------------------------------------------------
