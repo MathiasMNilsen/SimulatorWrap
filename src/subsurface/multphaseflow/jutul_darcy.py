@@ -28,7 +28,7 @@ os.environ['PYTHON_JULIACALL_HANDLE_SIGNALS'] = 'yes'
 os.environ['PYTHON_JULIACALL_THREADS'] = '1'
 os.environ['PYTHON_JULIACALL_OPTLEVEL'] = '3'
 warnings.filterwarnings('ignore', message='.*juliacall module already imported.*')
-#────────────────────────────────────────────────────────────────────── ──────────────
+#────────────────────────────────────────────────────────────────────────────────────
 
 PBAR_OPTS = {
     'ncols': 110,
@@ -87,7 +87,7 @@ class JutulDarcyWrapper:
         self.true_order = [self.reporttype, options['reportpoint']]
         self.steps = [i for i in range(len(self.true_order[1]))]
 
-        # Adjoint settings
+        # Extract adjoint options
         #---------------------------------------------------------------------------------------------------------
         if 'adjoints' in options:
             self.compute_adjoints = True
