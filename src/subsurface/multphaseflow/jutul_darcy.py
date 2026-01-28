@@ -78,9 +78,23 @@ class JutulDarcyWrapper:
         self.datatype   = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
         self.parallel   = options.get('parallel', 1)
         self.units      = options.get('units', 'metric') # This is not consistently used!
-
         self.datafile = None
         self.compute_adjoints = False
+
+        # Process datatypes
+        if isinstance(self.datatype, list) and len(self.datatype) == 1 and isinstance(self.datatype[0], dict):
+            d = []
+            for key in self.datatype[0]:
+                if self.datatype[0][key] is None:
+                    d.append(key)
+                else:
+                    for well in self.datatype[0][key]:
+                        d.append(f'{key}:{well}')
+            self.datatype = d
+        elif isinstance(self.datatype, list) and all(isinstance(dt, str) for dt in self.datatype):
+            self.datatype = self.datatype
+        else:
+            assert self.datatype == list, 'datatype must be a list or dict(list)'
 
         # This is for PET to work properly (should be removed in future versions)
         self.input_dict = options
@@ -117,6 +131,8 @@ class JutulDarcyWrapper:
 
                 # Determine steps
                 steps = options['adjoints'][datatype].get('steps', 'acc')
+                accumulative= False
+
                 if steps == 'acc':
                     steps = [self.steps[-1]]
                     accumulative = True
@@ -164,6 +180,9 @@ class JutulDarcyWrapper:
 
         if self.compute_adjoints:
             results, adjoints = zip(*outputs)
+            if len(inputs) == 1:
+                results  = results[0]
+                adjoints = adjoints[0]
             return results, adjoints
         else:
             return outputs
@@ -219,8 +238,22 @@ class JutulDarcyWrapper:
 
         # Simulate and get results
         jlres = jl.simulate_reservoir(case, info_level=-1)
-        pyres = convert_to_pydict(jlres, case, units=self.units)
+        pyres = convert_to_pydict(jlres, case, units='metric')
+        pyres = self.results_to_dataframe(pyres, self.datatype, jlcase=case, jl_import=jl)
 
+        # Convert output to requested format
+        if not self.out_format == 'dataframe':
+            if self.out_format == 'dict':
+                output = pyres.to_dict(orient='list')
+            elif self.out_format == 'list':
+                output = []
+                for idx, row in pyres.iterrows():
+                    output.append(row.to_dict())
+        else:
+            output = pyres
+
+        
+        # Compute adjoints
         if self.compute_adjoints:
 
             # Initialize adjoint dataframe
@@ -231,6 +264,7 @@ class JutulDarcyWrapper:
 
             adjoints = pd.DataFrame(columns=pd.MultiIndex.from_tuples(colnames), index=self.true_order[1])
             adjoints.index.name = self.true_order[0]
+            attrs = {}
 
             # Initialize progress bar
             pbar = tqdm(
@@ -278,17 +312,26 @@ class JutulDarcyWrapper:
                             grad_param = np.array(grad[jl.Symbol("porosity")])
                             grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
                             adjoints.at[index, (col, param)] = grad_param
+                            attrs[(col, param)] = {'unit': 'Sm3'}
 
                         elif param.lower().startswith('perm'):
                             grad_param = np.array(grad[jl.Symbol("permeability")])
+                            mD_per_m2 = _convert_from_si(1.0, 'darcy', jl) * 1e3
+                            grad_param  = grad_param/mD_per_m2  # Convert from m2 to mD
 
-                            m2_per_mD = 9.869233e-16
+                            if info['rate']:
+                                days_per_sec = _convert_from_si(1.0, 'day', jl)
+                                grad_param = grad_param/days_per_sec
+                                attrs[(col, param)] = {'unit': 'Sm3/(day∙mD)'}
+                            else:
+                                attrs[(col, param)] = {'unit': 'Sm3/mD'}
+
                             if param.lower() == 'permx':
-                                grad_param = grad_param[0] * m2_per_mD
+                                grad_param = grad_param[0]
                             elif param.lower() == 'permy':
-                                grad_param = grad_param[1] * m2_per_mD
+                                grad_param = grad_param[1]
                             elif param.lower() == 'permz':
-                                grad_param = grad_param[2] * m2_per_mD
+                                grad_param = grad_param[2]
                             
                             grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
                             adjoints.at[index, (col, param)] = grad_param
@@ -299,15 +342,14 @@ class JutulDarcyWrapper:
                 # Update progress bar
                 pbar.update(1)
             pbar.close()
+            adjoints.attrs = attrs
 
         os.chdir('..')
+        
 
         # Delete simulation folder
         if delete_folder:
             shutil.rmtree(folder)
-
-        # Extract requested datatypes
-        output = self.extract_datatypes(pyres, jlcase=case, out_format=self.out_format)
         
         if self.compute_adjoints:
             return output, adjoints
@@ -324,60 +366,47 @@ class JutulDarcyWrapper:
             f.write(template.render(**input))
 
 
-    def extract_datatypes(self, res: dict, jlcase =None, out_format='list') -> Union[dict|list|pd.DataFrame]:
-        '''
-        Extract requested datatypes from simulation results.
-
-        Parameters
-        ----------
-        res : dict
-            Simulation results dictionary.
-        out_format : str, optional
-            Output format ('list[dict]', 'dict', 'dataframe'), by default 'list'.
+    def results_to_dataframe(self, res: dict, datatypes: list, jlcase=None, jl_import=None) -> pd.DataFrame:
         
-        Returns
-        -------
-            Union[dict, list, pd.DataFrame]
-                Extracted data in the specified format.
-        '''
-        out = {}
-        for orginal_key in self.datatype:
-            key = orginal_key.upper()
+        df = pd.DataFrame(columns=datatypes, index=self.true_order[1])
+        df.index.name = self.true_order[0]
+        attrs = {}
+
+        for key in datatypes:
+            key_upper = key.upper()
 
             # Check if key is FIELD data
-            if key in res['FIELD']:
-                out[orginal_key] = res['FIELD'][key]
-            # Check if key is WELLS data (format: "DATA:WELL" or "DATA WELL")
-            elif ':' in key or ' ' in key:
-                data_id, well_id = key.replace(':', ' ').split(' ')
-                out[orginal_key] = res['WELLS'][well_id][data_id]
+            if key_upper in res['FIELD']:
+                df[key] = res['FIELD'][key_upper]
+                attrs[key_upper] = {'unit': _metric_unit(key_upper)}
 
-            elif key in [str(k) for k in jlcase.input_data["GRID"].keys()]:
-                value = jlcase.input_data["GRID"][f"{key}"]
+            # Check if key is WELLS data (format: "DATA:WELL" or "DATA WELL")
+            elif ':' in key_upper or ' ' in key_upper:
+                data_id, well_id = key_upper.replace(':', ' ').split(' ')
+                df[key] = res['WELLS'][well_id][data_id]
+                attrs[key_upper] = {'unit': _metric_unit(data_id)}
+
+            elif key_upper in [str(k) for k in jlcase.input_data["GRID"].keys()] and (jlcase is not None):
+                value = jlcase.input_data["GRID"][f"{key_upper}"]
+                
+                if key_upper.startswith('PERM'):
+                    value = _convert_from_si(value, 'darcy', jl_import)
+                    value = np.array(value) * 1e3 # Darcy to mD
+                    attrs[key_upper] = {'unit': 'mD'}
+                else:
+                    attrs[key_upper] = {'unit': _metric_unit(key_upper)}
+
                 try:
-                    out[orginal_key] = np.array(value)
+                    df.at[df.index[0], key] = np.array(value)
                 except:
-                    out[orginal_key] = value
+                    df.at[df.index[0], key] = value
+                
             else:
                 raise KeyError(f'Data type {key} not found in simulation results')
-        
-        # Format output
-        if out_format == 'list':
-            # Make into a list of dicts where each dict is a time step (pred_data format)
-            out_list = []
-            for i in range(len(res['DAYS'])):
-                time_step_data = {key: np.array([out[key][i]]) for key in out}
-                out_list.append(time_step_data)
-            return out_list
-        
-        elif out_format == 'dict':
-            out['DAYS'] = res['DAYS']
-            return out
-
-        elif out_format == 'dataframe':
-            df = pd.DataFrame(data=out, index=res['DAYS'])
-            return df
-        
+            
+        df.attrs = attrs
+        return df
+    
     
 def _symdict_to_pydict(symdict, jl_import):
     '''Convert a Julia symbolic dictionary to a Python dictionary recursively.'''
@@ -406,6 +435,42 @@ def _expand_to_active_grid(param, active, fill_value=np.nan):
         raise ValueError('Parameter length does not match number of active cells')
     
     return np.array(val)
+
+
+def _convert_from_si(value, unit, jl_import):
+    '''Convert value from SI units to specified unit using JutulDarcy conversion.'''
+    return jl_import.Jutul.convert_from_si(value, jl_import.Symbol(unit))
+
+def _metric_unit(key: str) -> str:
+    '''Return metric unit for given key.'''
+    unit_map = {
+        'PORO': '',
+        'PERMX': 'mD',
+        'PERMY': 'mD',
+        'PERMZ': 'mD',
+        #---------------------
+        'FOPT': 'Sm3',
+        'FGPT': 'Sm3',
+        'FWPT': 'Sm3',
+        'FWLT': 'Sm3',
+        'FWIT': 'Sm3',
+        #---------------------
+        'FOPR': 'Sm3/day',
+        'FGPR': 'Sm3/day',
+        'FWPR': 'Sm3/day',
+        'FLPR': 'Sm3/day',
+        'FWIR': 'Sm3/day',
+        #---------------------
+        'WOPR': 'Sm3/day',
+        'WGPR': 'Sm3/day',
+        'WWPR': 'Sm3/day',
+        'WLPR': 'Sm3/day',
+        'WWIR': 'Sm3/day',
+    }
+    if key.upper() in unit_map:
+        return unit_map[key.upper()]
+    else:
+        return 'Unknown'
 
 
 def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, jl_import=None):
