@@ -11,11 +11,14 @@ import numpy as np
 import warnings
 import shutil
 import os
+import datetime as dt
 
 from mako.template import Template
 from typing import Union
 from p_tqdm import p_map
 from tqdm import tqdm
+import io
+from contextlib import redirect_stderr, redirect_stdout
 #────────────────────────────────────────────────────
 
 
@@ -30,10 +33,11 @@ os.environ['PYTHON_JULIACALL_OPTLEVEL'] = '3'
 warnings.filterwarnings('ignore', message='.*juliacall module already imported.*')
 #────────────────────────────────────────────────────────────────────────────────────
 
+
 PBAR_OPTS = {
     'ncols': 110,
     'colour': "#285475",
-    'bar_format': '{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+    'bar_format': '{desc}: {percentage:3.0f}% [{bar}] {n_fmt}/{total_fmt} │ ⏱ {elapsed}<{remaining} │ {rate_fmt}',
     'ascii': '-◼', # Custom bar characters for a sleeker look
 }
 
@@ -41,19 +45,50 @@ PBAR_OPTS = {
 class JutulDarcyWrapper:
 
     def __init__(self, options):
-        '''
-        Wrapper for the JutulDarcy simulator [1].
+        """
+        Initialize the JutulDarcy simulator wrapper.
+
+        This wrapper provides an interface for running JutulDarcy reservoir simulations
+        with support for ensemble-based workflows, parallel execution, and automatic
+        adjoint sensitivity computation.
 
         Parameters
         ----------
         options : dict
-            Configuration options for the wrapper.
-            Keys:
-                - 'makofile' or 'runfile': Path to the makofile.mako or runfile.DATA template.
-                - 'reporttype': Type of report (default: 'days').
-                - 'out_format': Output format ('list', 'dict', 'dataframe'; default: 'list').
-                - 'datatype': List of data types to extract (default: ['FOPT', 'FGPT', 'FWPT', 'FWIT']).
-                - 'parallel': Number of parallel simulations (default: 1).
+            Configuration options for the wrapper. The following keys are supported:
+
+            - makofile : str
+                Path to the Mako template file (.mako). Required unless 'runfile' is provided.
+            - runfile : str
+                Path to the runfile (.DATA). If provided, the corresponding .mako file
+                is derived. Required unless 'makofile' is provided.
+            - reporttype : str, optional
+                Type of report index ('days' or 'date'). Default is 'days'.
+            - reportpoint : list
+                Collection of report points (timesteps or dates). Required.
+            - out_format : {'list', 'dict', 'dataframe'}, optional
+                Output format for simulation results. Default is 'list'.
+            - datatype : list of str, optional
+                List of data types to extract from simulation results.
+                Default is ['FOPT', 'FGPT', 'FWPT', 'FWIT'].
+            - parallel : int, optional
+                Number of parallel simulations to run. Default is 1.
+            - units : {'metric', 'si', 'field'}, optional
+                Unit system for the simulator. Default is 'metric'.
+            - adjoints : dict, optional
+                Dictionary specifying adjoint sensitivity configuration. When provided,
+                adjoint calculations are performed. Structure:
+                {datatype: {
+                    'well_id': str or list,
+                    'parameters': str or list,
+                    'steps': 'acc' | 'all' | int
+                    }
+                }
+
+        Raises
+        ------
+        ValueError
+            If neither 'makofile' nor 'runfile' is provided in options.
 
         References
         ----------
@@ -61,7 +96,7 @@ class JutulDarcyWrapper:
             JutulDarcy.jl - a fully differentiable high-performance reservoir simulator
             based on automatic differentiation. Computational Geosciences, 29, Article 30.
             https://doi.org/10.1007/s10596-025-10366-6
-        '''
+        """
         # Make makofile an mandatory option
         if ('makofile' not in options) and ('runfile' not in options):
             raise ValueError('Wrapper  requires a makofile (or runfile) option')
@@ -77,26 +112,25 @@ class JutulDarcyWrapper:
         self.out_format = options.get('out_format', 'list')
         self.datatype   = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
         self.parallel   = options.get('parallel', 1)
-        self.units      = options.get('units', 'metric') # This is not consistently used!
+        self.units      = options.get('units', 'metric') # Not currently used!
         self.datafile = None
         self.compute_adjoints = False
 
-        # Process datatypes
-        if isinstance(self.datatype, list) and len(self.datatype) == 1 and isinstance(self.datatype[0], dict):
-            d = []
-            for key in self.datatype[0]:
-                if self.datatype[0][key] is None:
-                    d.append(key)
-                else:
-                    for well in self.datatype[0][key]:
-                        d.append(f'{key}:{well}')
-            self.datatype = d
-        elif isinstance(self.datatype, list) and all(isinstance(dt, str) for dt in self.datatype):
-            self.datatype = self.datatype
-        else:
-            assert self.datatype == list, 'datatype must be a list or dict(list)'
+        # Process datatype entries for well data
+        datatype = []
+        for dt in self.datatype:
+            dt = dt.split(' - ')
+            if len(dt) == 1:
+                datatype.append(dt[0])
+            else:
+                t = dt[0]
+                d = []
+                for item in dt[1:]:
+                    d.append(f'{t}:{item}')
+                datatype.extend(d)
+        self.datatype = datatype
 
-        # This is for PET to work properly (should be removed in future versions)
+        # This is for PET to work properly
         self.input_dict = options
         self.true_order = [self.reporttype, options['reportpoint']]
         self.steps = [i for i in range(len(self.true_order[1]))]
@@ -109,25 +143,18 @@ class JutulDarcyWrapper:
             self.adjoint_info = {}
             for datatype in options['adjoints']:
                 
-                # Determine if rate or volume and phase. 
-                if datatype in ['WOPT', 'WGPT', 'WWPT', 'WLPT']:
-                    rate  = False
-                    phase = {
-                        'WOPT': 'oil',
-                        'WGPT': 'gas',
-                        'WWPT': 'water',
-                        'WLPT': 'liquid',
-                    }[datatype]
-                
-                elif datatype in ['WOPR', 'WGPR', 'WWPR', 'WLPR']:
-                    rate  = True
-                    phase = {
-                        'WOPR': 'oil',
-                        'WGPR': 'gas',
-                        'WWPR': 'water',
-                        'WLPR': 'liquid',
-                    }[datatype]
-
+                # Determine phase and if rate or volumes
+                rate_map = {
+                    'WOPT': ('oil', True),
+                    'WGPT': ('gas', True),
+                    'WWPT': ('water', True),
+                    'WLPT': ('liquid', True),
+                    'WOPR': ('oil', False),
+                    'WGPR': ('gas', False),
+                    'WWPR': ('water', False),
+                    'WLPR': ('liquid', False),
+                }
+                phase, rate = rate_map[datatype]
 
                 # Determine steps
                 steps = options['adjoints'][datatype].get('steps', 'acc')
@@ -150,6 +177,7 @@ class JutulDarcyWrapper:
                 well_ids = well_ids if isinstance(well_ids, (list, tuple)) else [well_ids]
                 parameters = parameters if isinstance(parameters, (list, tuple)) else [parameters]
 
+                # Store adjoint info for adjoint computations
                 for wid in well_ids:
                     self.adjoint_info[f'{datatype}:{wid}'] = {
                         'rate': rate,
@@ -161,7 +189,43 @@ class JutulDarcyWrapper:
                     }
         #---------------------------------------------------------------------------------------------------------
 
-    def __call__(self, inputs: dict):
+    def __call__(self, inputs: list[dict]):
+        """
+        Execute parallel forward simulations for all ensemble members.
+
+        This method runs the forward simulation for all input parameter sets in parallel,
+        optionally computing adjoint sensitivities if configured.
+
+        Parameters
+        ----------
+        inputs : list of dict
+            List containing input parameter sets, indexed by ensemble member
+
+            number (0, 1, 2, ...). Each value is a dict of parameters for that member.
+
+        Returns
+        -------
+        output : list of (dict, list, or pd.DataFrame)
+            Forward simulation results for all ensemble members, formatted according
+            to the 'out_format' option specified during initialization.
+        adjoints : pd.DataFrame, optional
+            Adjoint sensitivities for all objectives and parameters. Only returned if
+            'adjoints' configuration was provided during initialization. Contains
+            multi-indexed columns (objective, parameter) and index based on reporttype.
+
+        Notes
+        -----
+        - Existing simulation folders (En_*) are deleted before execution to prevent
+          conflicts from previous runs.
+        - Parallel execution uses the number of CPUs specified in the 'parallel' option.
+        - Progress is displayed via a progress bar during execution.
+
+        Examples
+        --------
+        >>> simulator = JutulDarcyWrapper(options)
+        >>> inputs = [{'param1': [1, 2, 3]}, {'param1': [1.1, 2.1, 3.1]}]
+        >>> results = simulator(inputs)
+        """
 
         # Delet all existing En_* folders
         for item in os.listdir('.'):
@@ -175,6 +239,8 @@ class JutulDarcyWrapper:
             list(range(len(inputs))), 
             num_cpus=self.parallel,
             unit='sim',
+            desc='Simulations',
+            leave=False,
             **PBAR_OPTS
         )
 
@@ -189,25 +255,53 @@ class JutulDarcyWrapper:
                      
 
     def run_fwd_sim(self, input: dict, idn: int=0, delete_folder: bool=True):
-        '''
-        Run forward simulation for given input parameters.
+        """
+        Execute a forward reservoir simulation for a single ensemble member.
+
+        This method performs the complete simulation workflow including case setup,
+        execution, results extraction, and optional adjoint sensitivity computation.
+        The simulation runs in an isolated folder that is optionally cleaned up
+        upon completion.
 
         Parameters
         ----------
-        input: dict
-            Input parameters for the simulation.
-
-        idn: int, optional
-            Ensemble member ID, by default 0.
-
-        delete_folder: bool, optional
-            Whether to delete the simulation folder after running, by default True.
+        input : dict
+            Dictionary containing input parameters for the simulation. Typically includes
+            property grids (PERMX, PERMY, PERMZ, PORO) and other reservoir model parameters.
+        idn : int, optional
+            Ensemble member identifier (0, 1, 2, ...). Used to name the simulation folder
+            and track adjoint results. Default is 0.
+        delete_folder : bool, optional
+            If True, the simulation folder (En_{idn}) is deleted after completion.
+            If False, the folder and all output files are retained. Default is True.
 
         Returns
         -------
-            output: Union[dict, list, pd.DataFrame]
-                Simulation output in the specified format.
-        '''
+        output : dict, list, or pd.DataFrame
+            Forward simulation results in the format specified by the 'out_format' option:
+            - 'list': List of dictionaries, one per report point
+            - 'dict': Dictionary with results as lists
+            - 'dataframe': pandas DataFrame with results
+        adjoints : pd.DataFrame, optional
+            Adjoint sensitivities with multi-indexed columns (objective, parameter).
+            Only returned if 'adjoints' configuration was provided during initialization.
+
+        Notes
+        -----
+        - A dedicated folder En_{idn} is created for each simulation and contains
+          the rendered .DATA file and all JutulDarcy output.
+        - Julia output and warnings are suppressed during case setup unless suppress
+          flag is explicitly disabled in the code.
+        - Adjoint computation includes unit conversions (e.g., mD for permeability,
+          Sm3 for volumes) and handles both active and inactive grid cells.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the datafile cannot be found after rendering the makofile.
+        KeyError
+            If required simulation results are not found in JutulDarcy output.
+        """
         from juliacall import Main as jl
         from jutuldarcy import convert_to_pydict
         jl.seval("using JutulDarcy, Jutul")
@@ -225,20 +319,45 @@ class JutulDarcyWrapper:
         # Enter simulation folder and run simulation
         os.chdir(folder)
 
-        # Setup case
-        case = jl.setup_case_from_data_file(self.datafile)
+        # Setup case from datafile (suppress all output including well processing messages)
+        suppress = True
+        if suppress:
+            case = jl.seval(f"""
+            redirect_stdout(devnull) do
+                redirect_stderr(devnull) do
+                    setup_case_from_data_file(
+                        "{self.datafile}";
+                        parse_arg=(silent=true, verbose=false, warn_parsing=false, warn_feature=false)
+                    )
+                end
+            end
+            """)
+        else:
+            case = jl.setup_case_from_data_file(self.datafile)
+            
+
+        # Get Units
+        if jl.haskey(case.input_data["RUNSPEC"], "METRIC"):
+            units = 'metric'
+        elif jl.haskey(case.input_data["RUNSPEC"], "SI"):
+            units = 'si'
+        elif jl.haskey(case.input_data["RUNSPEC"], "FIELD"):
+            units = 'field'
+        else:
+            units = jl.missing
 
         # Get some grid info
-        nx = case.input_data["GRID"]["cartDims"][0]
-        ny = case.input_data["GRID"]["cartDims"][1]  
-        nz = case.input_data["GRID"]["cartDims"][2]
+        nx, ny, nz = case.input_data["GRID"]["cartDims"]
         grid = (nx, ny, nz)
-        actnum = np.array(case.input_data["GRID"]["ACTNUM"]) # Shape (nx, ny, nz)
-        actnum_vec = actnum.flatten(order='F')  # Fortran order flattening
+        try:
+            actnum = np.array(case.input_data["GRID"]["ACTNUM"]) # Shape (nx, ny, nz)
+            actnum_vec = actnum.flatten(order='F')  # Fortran order flattening
+        except:
+            actnum_vec = np.ones(nx*ny*nz)
 
         # Simulate and get results
         jlres = jl.simulate_reservoir(case, info_level=-1)
-        pyres = convert_to_pydict(jlres, case, units='metric')
+        pyres = convert_to_pydict(jlres, case, units=units)
         pyres = self.results_to_dataframe(pyres, self.datatype, jlcase=case, jl_import=jl)
 
         # Convert output to requested format
@@ -248,7 +367,9 @@ class JutulDarcyWrapper:
             elif self.out_format == 'list':
                 output = []
                 for idx, row in pyres.iterrows():
-                    output.append(row.to_dict())
+                    row_dict = row.to_dict()
+                    row_dict = {k: np.atleast_1d(v) for k, v in row_dict.items()}
+                    output.append(row_dict)
         else:
             output = pyres
 
@@ -267,6 +388,7 @@ class JutulDarcyWrapper:
             attrs = {}
 
             # Initialize progress bar
+            PBAR_OPTS.pop('colour', None)
             pbar = tqdm(
                 adjoints.keys(), 
                 desc=f'Solving adjoints for En_{idn}',
@@ -274,6 +396,7 @@ class JutulDarcyWrapper:
                 leave=False,
                 unit='obj',
                 dynamic_ncols=False,
+                colour="#713996",
                 **PBAR_OPTS
             )
             
@@ -293,14 +416,23 @@ class JutulDarcyWrapper:
                 # Define objective function
                 funcs = funcs if isinstance(funcs, list) else [funcs]
                 grads = []
+                jl.case = case
+                jl.jlres = jlres
                 for func in funcs:
                     # Compute adjoint gradient
-                    grad = jl.JutulDarcy.reservoir_sensitivities(
-                        case, 
-                        jlres, 
-                        func,
-                        include_parameters=True,
-                    )
+                    jl.func = func
+                    grad = jl.seval("""
+                    redirect_stdout(devnull) do
+                        redirect_stderr(devnull) do
+                            JutulDarcy.reservoir_sensitivities(
+                                case, 
+                                jlres, 
+                                func,
+                                include_parameters=true
+                            )
+                        end
+                    end
+                    """)
                     grads.append(grad)
 
                 # Extract and store gradients in adjoint dataframe
@@ -314,7 +446,7 @@ class JutulDarcyWrapper:
                             adjoints.at[index, (col, param)] = grad_param
                             attrs[(col, param)] = {'unit': 'Sm3'}
 
-                        elif param.lower().startswith('perm'):
+                        elif 'perm' in param.lower():
                             grad_param = np.array(grad[jl.Symbol("permeability")])
                             mD_per_m2 = _convert_from_si(1.0, 'darcy', jl) * 1e3
                             grad_param  = grad_param/mD_per_m2  # Convert from m2 to mD
@@ -328,13 +460,31 @@ class JutulDarcyWrapper:
 
                             if param.lower() == 'permx':
                                 grad_param = grad_param[0]
+                            elif param.lower() == 'log_permx':
+                                permx = np.array(case.input_data["GRID"]["PERMX"])
+                                permx = _convert_from_si(permx, 'darcy', jl_import=jl)
+                                permx = np.array(permx)* 1e3 # Darcy to mD
+                                grad_param = grad_param[0]/permx.flatten(order='F')
+
                             elif param.lower() == 'permy':
                                 grad_param = grad_param[1]
+                            elif param.lower() == 'log_permy':
+                                permy = np.array(case.input_data["GRID"]["PERMY"])
+                                permy = _convert_from_si(permy, 'darcy', jl_import=jl)
+                                permy = np.array(permy)* 1e3 # Darcy to mD
+                                grad_param = grad_param[1]/permy.flatten(order='F')
+
                             elif param.lower() == 'permz':
                                 grad_param = grad_param[2]
+                            elif param.lower() == 'log_permz':
+                                permz = np.array(case.input_data["GRID"]["PERMZ"])
+                                permz = _convert_from_si(permz, 'darcy', jl_import=jl)
+                                permz = np.array(permz)* 1e3 # Darcy to mD
+                                grad_param = grad_param[2]/permz.flatten(order='F')
                             
                             grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
                             adjoints.at[index, (col, param)] = grad_param
+
                         else:
                             raise ValueError(f'Param: {param} not supported for adjoint sensitivity')
                 
@@ -357,9 +507,39 @@ class JutulDarcyWrapper:
             return output
 
     def render_makofile(self, makofile: str, folder: str, input: dict):
-        '''
-        Render makofile.mako to makofile.DATA using input
-        '''
+        """
+        Render Mako template file to Eclipse-format DATA file.
+
+        This method uses the Mako templating engine to render a .mako template
+        file into an Eclipse-format .DATA file, substituting template variables
+        with values from the input dictionary.
+
+        Parameters
+        ----------
+        makofile : str
+            Path to the Mako template file (.mako extension).
+        folder : str
+            Directory where the rendered .DATA file will be written.
+        input : dict
+            Dictionary of template variables to be substituted in the Mako template.
+            Keys should match template variable names.
+
+        Returns
+        -------
+        None
+
+        Side Effects
+        ____________
+        - Creates a .DATA file in the specified folder with the same basename as makofile.
+        - Updates self.datafile with the path to the rendered DATA file.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the makofile does not exist.
+        MakoException
+            If the Mako template contains syntax errors or undefined variables.
+        """
         self.datafile = makofile.replace('.mako', '.DATA')
         template = Template(filename=makofile)
         with open(os.path.join(folder, self.datafile), 'w') as f:
@@ -367,7 +547,58 @@ class JutulDarcyWrapper:
 
 
     def results_to_dataframe(self, res: dict, datatypes: list, jlcase=None, jl_import=None) -> pd.DataFrame:
+        """
+        Convert simulation results to a pandas DataFrame with metadata.
+
+        This method extracts specified datatypes from JutulDarcy simulation results
+        and organizes them into a structured DataFrame with proper units and indexing.
+        Supports both temporal data (from FIELD and WELLS) and static grid properties.
+
+        Parameters
+        ----------
+        res : dict
+            Simulation results dictionary from JutulDarcy containing keys:
+            - 'FIELD': Dictionary of field-level data (FOPT, FGPT, etc.)
+            - 'WELLS': Dictionary of well-level data by well name
+            - 'DAYS': Array of timestep values in days
+        datatypes : list of str
+            Data types to extract. Formats supported:
+            - Field data: 'FOPT', 'FGPT', 'FOPR', etc.
+            - Well data: 'WOPT:WELL1', 'WWPR:INJ1' (colon or space separated)
+            - Grid properties: 'PERMX', 'PERMY', 'PERMZ', 'PORO'
+        jlcase : JutulDarcy.SimulationCase, optional
+            JutulDarcy simulation case object containing grid and input data.
+            Required for accessing grid properties (PERMX, PERMY, etc.).
+        jl_import : module, optional
+            Julia Main module from juliacall. Used for unit conversions.
+            Required if datatypes include permeability values.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame indexed by reportpoint (days or dates) with:
+            - Columns: Requested datatypes
+            - Attribute 'attrs': Dictionary mapping datatype to metadata (unit information)
+            - Index name: 'days' or 'date' based on reporttype configuration
+
+        Notes
+        -----
+        - Permeability values are converted from SI units (m²) to millidarcies (mD).
+        - For well data, if the well is not found, that (time, datatype) entry remains NaN.
+        - Grid properties are typically singleton values assigned to the first index.
+        - Date conversion uses the START date from RUNSPEC section.
+
+        Raises
+        ------
+        KeyError
+            If a requested datatype is not found in field data, well data, or grid properties.
+        ValueError
+            If datatypes are malformed or reference non-existent wells.
+        """
         
+        # Get start date
+        start_date = jlcase.input_data["RUNSPEC"]['START']
+
         df = pd.DataFrame(columns=datatypes, index=self.true_order[1])
         df.index.name = self.true_order[0]
         attrs = {}
@@ -377,14 +608,31 @@ class JutulDarcyWrapper:
 
             # Check if key is FIELD data
             if key_upper in res['FIELD']:
-                df[key] = res['FIELD'][key_upper]
+                for d, day in enumerate(res['DAYS']):
+                    if self.true_order[0] == 'days':
+                        if day in self.true_order[1]:
+                            df.at[day, key] = res['FIELD'][key_upper][d]
+                    elif self.true_order[0] == 'date':
+                        date = start_date + dt.timedelta(days=int(day))
+                        if date in self.true_order[1]:
+                            df.at[date, key] = res['FIELD'][key_upper][d]
                 attrs[key_upper] = {'unit': _metric_unit(key_upper)}
 
             # Check if key is WELLS data (format: "DATA:WELL" or "DATA WELL")
             elif ':' in key_upper or ' ' in key_upper:
-                data_id, well_id = key_upper.replace(':', ' ').split(' ')
-                df[key] = res['WELLS'][well_id][data_id]
-                attrs[key_upper] = {'unit': _metric_unit(data_id)}
+                datakey, wid = key_upper.replace(':', ' ').split(' ')
+                for d, day in enumerate(res['DAYS']):
+                    
+                    if self.true_order[0] == 'days':
+                        if day in self.true_order[1]:
+                            df.at[day, key] = res['WELLS'][wid][datakey][d]
+                    elif self.true_order[0] == 'date':
+
+                        date = start_date + dt.timedelta(days=int(day))
+                        if date in self.true_order[1]:
+                            df.at[date, key] = res['WELLS'][wid][datakey][d]
+
+                attrs[key_upper] = {'unit': _metric_unit(key.upper())}
 
             elif key_upper in [str(k) for k in jlcase.input_data["GRID"].keys()] and (jlcase is not None):
                 value = jlcase.input_data["GRID"][f"{key_upper}"]
@@ -406,10 +654,44 @@ class JutulDarcyWrapper:
             
         df.attrs = attrs
         return df
+
+def _extract_well_data(wdata, datakey, wid, reporttype, reportpoint):
+    pass
+
+def _extract_field_data(fdata, datakey, reporttype, reportpoint):
+    pass
+
+def _extract_grid_property(gdata, datakey):
+    pass
     
-    
+
 def _symdict_to_pydict(symdict, jl_import):
-    '''Convert a Julia symbolic dictionary to a Python dictionary recursively.'''
+    """
+    Recursively convert Julia symbolic dictionary to Python dictionary.
+
+    This utility function converts JutulDarcy result dictionaries containing Julia
+    symbolic keys and nested dictionaries to native Python types.
+
+    Parameters
+    ----------
+    symdict : Julia AbstractDict
+        Julia dictionary object with symbolic keys.
+    jl_import : module
+        Julia Main module from juliacall for type checking.
+
+    Returns
+    -------
+    dict
+        Python dictionary with string keys and recursively converted values.
+        All Julia AbstractDict values are recursively converted.
+
+    Notes
+    -----
+    - Recursion handles arbitrarily nested dictionary structures.
+    - Julia symbols are converted to Python strings.
+    - Non-dictionary values are returned unchanged (caller is responsible for
+      converting array and numeric types as needed).
+    """
     pydict = {}
     for key, value in symdict.items():
         if jl_import.isa(value, jl_import.AbstractDict):
@@ -419,7 +701,40 @@ def _symdict_to_pydict(symdict, jl_import):
     return pydict
     
 def _expand_to_active_grid(param, active, fill_value=np.nan):
+    """
+    Expand parameter values from active cells to full grid.
 
+    This utility function maps values defined only for active cells to correspond-
+    ing positions in the full grid (including inactive cells), which is necessary
+    because JutulDarcy computations often only involve active grid cells.
+
+    Parameters
+    ----------
+    param : array-like
+        Parameter values, either for active cells only (length = active.sum())
+        or for all cells (length = len(active)).
+    active : array-like
+        Boolean or binary (0/1) array indicating active cells. Shape (n_cells,).
+    fill_value : float, optional
+        Value to assign to inactive cells. Default is np.nan.
+
+    Returns
+    -------
+    np.ndarray
+        Array of length len(active) with values expanded to full grid:
+        - Active cell positions: values from param
+        - Inactive cell positions: fill_value
+
+    Raises
+    ------
+    ValueError
+        If param length is neither active.sum() nor len(active).
+
+    Notes
+    -----
+    - Fortran-order (column-major) cell indexing is assumed for mapping.
+    - This is typically used for gradient expansion in sensitivity analysis.
+    """
     if len(param) == active.sum():
         val = []
         i = 0
@@ -438,11 +753,73 @@ def _expand_to_active_grid(param, active, fill_value=np.nan):
 
 
 def _convert_from_si(value, unit, jl_import):
-    '''Convert value from SI units to specified unit using JutulDarcy conversion.'''
+    """
+    Convert numerical values from SI units to specified unit system.
+
+    This utility function leverages JutulDarcy's built-in unit conversion
+    to transform SI-based values to alternative unit systems (e.g., millidarcies,
+    days, surface cubic meters).
+
+    Parameters
+    ----------
+    value : float or array-like
+        Numerical value(s) in SI units to convert.
+    unit : str
+        Target unit name as string. Common values: 'darcy', 'day', 'Sm3'.
+        Full list of supported units depends on Jutul.UnitSystem.
+    jl_import : module
+        Julia Main module from juliacall providing Jutul.convert_from_si.
+
+    Returns
+    -------
+    float or array-like
+        Converted value(s) in specified units, matching input type.
+
+    Notes
+    -----
+    - Permeability: SI is m², commonly converted to mD (millidarcies) using factor ≈ 1e15.
+    - Time: SI is seconds, commonly converted to days using factor ≈ 1.157e-5.
+    - This is a thin wrapper around Jutul.convert_from_si for convenience.
+    """
     return jl_import.Jutul.convert_from_si(value, jl_import.Symbol(unit))
 
 def _metric_unit(key: str) -> str:
-    '''Return metric unit for given key.'''
+    """
+    Return the metric unit string for a given data key.
+
+    Maps Eclipse output keywords and property names to their corresponding
+    metric/SI units used in the JutulDarcy simulator.
+
+    Parameters
+    ----------
+    key : str
+        Eclipse keyword or property name. Case-insensitive.
+        Examples: 'FOPT', 'FOPR', 'WOPR', 'PERMX', 'PORO', 'WWIR'.
+
+    Returns
+    -------
+    str
+        Unit string corresponding to the key. Returns 'Unknown' if key is not
+        in the predefined mapping.
+
+    Notes
+    -----
+    Supported keywords and their units:
+    - PORO: dimensionless fraction
+    - PERM*: millidarcies (mD)
+    - FOPT, FGPT, FWPT, FWLT, FWIT: surface cubic meters (Sm3)
+    - FOPR, FGPR, FWPR, FLPR, FWIR: volumetric flow (Sm3/day)
+    - WOPR, WGPR, WWPR, WLPR, WWIR: well volumetric flow (Sm3/day)
+
+    Examples
+    --------
+    >>> _metric_unit('FOPT')
+    'Sm3'
+    >>> _metric_unit('PERMX')
+    'mD'
+    >>> _metric_unit('PORO')
+    ''
+    """
     unit_map = {
         'PORO': '',
         'PERMX': 'mD',
