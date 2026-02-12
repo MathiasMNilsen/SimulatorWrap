@@ -397,7 +397,7 @@ class JutulDarcyWrapper:
                     position=idn+1,
                     leave=False,
                     unit='obj',
-                    dynamic_ncols=True,
+                    dynamic_ncols=False,
                     colour="#713996",
                     **PBAR_OPTS
                 )
@@ -982,7 +982,7 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, 
         for sid in step_id:
             jl_import.seval(f"""
             function objective_function_{sid}(model, state, dt, step_i, forces)
-                if step_i != {sid+1}
+                if step_i[:step] != {sid+1}
                     return 0.0
                 else
                     rate = JutulDarcy.compute_well_qoi(
@@ -1005,7 +1005,7 @@ def get_well_objective(well_id, rate_id, step_id, rate=True, accumulative=True, 
     else:
         jl_import.seval(f"""
         function objective_function(model, state, dt, step_i, forces)
-            if step_i != {step_id+1}
+            if step_i[:step] != {step_id+1}
                 return 0.0
             else
                 rate = JutulDarcy.compute_well_qoi(
