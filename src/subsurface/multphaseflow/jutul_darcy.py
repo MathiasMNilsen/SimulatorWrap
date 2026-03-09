@@ -524,7 +524,7 @@ class JutulDarcyWrapper:
         """
         if param.lower() == 'poro':
             grad_param = np.array(grad[jl.Symbol("porosity")])
-            grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
+            grad_param = _expand_to_full_grid(grad_param, actnum_vec, fill_value=0)
             return grad_param, 'Sm3'
 
         elif 'perm' in param.lower():
@@ -543,7 +543,7 @@ class JutulDarcyWrapper:
             # Extract specific permeability component
             perm_component = {'permx': 0, 'permy': 1, 'permz': 2}[param.lower()]
             grad_param = grad_param[perm_component]
-            grad_param = _expand_to_active_grid(grad_param, actnum_vec, fill_value=0)
+            grad_param = _expand_to_full_grid(grad_param, actnum_vec, fill_value=0)
             
             return grad_param, unit
         else:
@@ -757,7 +757,7 @@ def _symdict_to_pydict(symdict, jl_import):
             pydict[str(key)] = value
     return pydict
     
-def _expand_to_active_grid(param, active, fill_value=np.nan):
+def _expand_to_full_grid(param, active, fill_value=np.nan):
     """
     Expand parameter values from active cells to full grid.
 
