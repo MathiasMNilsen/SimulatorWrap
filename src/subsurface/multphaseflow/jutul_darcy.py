@@ -51,21 +51,31 @@ class JutulDarcy:
 
             - ``runfile`` : str, optional
                 Path to either a ``.mako`` template or a ``.DATA`` run file.
+
             - ``reporttype`` : {"days", "dates"}, optional
                 Type of report index. Default is ``"days"``.
+
             - ``reportpoint`` : list, optional
                 Report points used for output indexing. For ``"days"`` this is
                 a list of numeric day values; for ``"dates"`` a list of
                 ``datetime`` objects.
+
             - ``datatype`` : list[str], optional
                 Result keywords to extract. Supports field keys (for example
                 ``"FOPT"``) and well keys (for example ``"WOPR:PROD1"``).
+
             - ``adjoints`` : dict, optional
                 Objective and parameter configuration for adjoint sensitivities.
+
             - ``output_format`` : {"list", "dict", "dataframe"}, optional
-                Output representation for forward results. Default is ``"list"``.
+                Output representation for forward results. Default is ``"list"``. 
+                (will probably be dataframe in the future)
+
             - ``adjoint_pbar`` : bool, optional
-                If ``True``, display progress bars during adjoint solves.
+                If ``True``, display progress bars during adjoint solves. 
+                Not recommended for large ensembles due to many progress bars. 
+                Default is ``True``.
+
             - ``parallel`` : int, optional
                 Number of processes for ensemble simulations. Default is ``1``.
         """
@@ -88,8 +98,12 @@ class JutulDarcy:
         if 'adjoints' in options:
             self.compute_adjoints = True
             self.adjoint_info = _process_adjoint_info(options['adjoints']) 
+            self.eval_adjoint_funcs = options.get('eval_adjoint_funcs', True)
+            self.adjoint_funcs = None
         else:
             self.compute_adjoints = False
+            self.eval_adjoint_funcs = False
+            self.adjoint_funcs = None
 
         # Other options
         self.output_format = options.get('output_format', 'list') # list, dict or dataframe
@@ -98,7 +112,7 @@ class JutulDarcy:
 
         # This is for PET to work properly
         self.input_dict = options
-        self.true_order = [self.reporttype, options['reportpoint']]
+        self.true_order = self.index
 
     
     def __call__(self, inputs: list[dict]|dict|str):
@@ -250,7 +264,10 @@ class JutulDarcy:
             # Initialize adjoint results storage
             info = self.adjoint_info
             columns = info.keys()
-            adjoint_dict = {(col, param): [] for col in columns for param in info[col]['parameters']}
+            grad_dict = {(col, param): [] for col in columns for param in info[col]['parameters']}
+
+            if self.eval_adjoint_funcs:
+                func_dict = {col: [] for col in columns} # For storing functions for each objective
 
             # Setup progress bar (iterate over adjoint objectives, not DataFrame columns)
             if self.adjoint_pbar:
@@ -309,12 +326,11 @@ class JutulDarcy:
                     pbar.set_description_str(update_desc)
 
                 # Comute adjoint sensitivities
-                grads = []
                 julia.case = case
                 julia.res = jlres
                 for func in funcs:
                     julia.func = func
-                    res_sens = julia.seval("""
+                    grad = julia.seval("""
                     redirect_stdout(devnull) do
                         redirect_stderr(devnull) do
                             JutulDarcy.reservoir_sensitivities(
@@ -324,15 +340,15 @@ class JutulDarcy:
                         end
                     end
                     """)
-                    grads.append(res_sens)
 
-                # Evaluate functions
-                if False:
-                    func_val = Jutul.evaluate_objective(func, case, jlres.result)
+                    # Evaluate functions
+                    if self.eval_adjoint_funcs:
+                        func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
+                        func_val = func_val*24*60*60 if info['is_rate'] else func_val
+                        func_dict[col].append(func_val)
 
 
-                # Extract parameter sensitivities for this objective and store in dict
-                for grad in grads:
+                    # Extract parameter sensitivities for this objective and store in dict
                     for param in info['parameters']:
                         grad_param = _extract_adjoint(
                             grad, 
@@ -342,19 +358,25 @@ class JutulDarcy:
                             info['is_rate'], 
                             julia
                         )
-                        adjoint_dict[(col, param)].append(grad_param)
+                        grad_dict[(col, param)].append(grad_param)
 
             if self.adjoint_pbar:
                 pbar.close()
 
             # Create adjoint dataframe with MultiIndex columns
-            cols = pd.MultiIndex.from_tuples(adjoint_dict.keys())
-            adjoints = pd.DataFrame(adjoint_dict, columns=cols, index=self.index[1])
+            cols = pd.MultiIndex.from_tuples(grad_dict.keys())
+            adjoints = pd.DataFrame(grad_dict, columns=cols, index=self.index[1])
             adjoints.index.name = self.index[0]
             adjoints.attrs = {'units': units}
         # ----------------------------------------------------------------------------------------------
 
         os.chdir('..')
+
+        # Function values dataframe
+        if self.eval_adjoint_funcs:
+            fun = pd.DataFrame(func_dict, index=adjoints.index)
+            fun.index.name = adjoints.index.name
+            self.adjoint_funcs = fun
         
         # Delete simulation folder
         if delete_folder:
@@ -464,7 +486,7 @@ def _extract_adjoint(jlgrad, jlcase, parameter, actnum, is_rate, julia):
         if 'log' in parameter.lower():
             perm = np.array(jlcase.input_data['GRID'][['PERMX', 'PERMY', 'PERMZ'][index]])
             adjoint = adjoint * perm.flatten(order='F')
-            # Note: For dJ/dlog(perm) = dJ/dperm * perm, we dont need to convert perm from mD to m2.
+            # Note: For dJ/dlog(perm) = dJ/dperm * perm, no need to convert from m2 to mD.
         else:
             m2_per_mD = 9.86923000000e-16 # m2/mD
             adjoint = adjoint * m2_per_mD
