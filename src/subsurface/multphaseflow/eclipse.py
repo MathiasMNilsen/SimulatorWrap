@@ -379,9 +379,62 @@ class eclipse:
             with RFTReader.open('En_' + str(member) + os.sep + self.file) as rft:
                 rft_values = list(rft)
                 rft_df = pd.DataFrame([
-                    {'date': elem.date, f"RFT:{elem.well}": elem['PRESSURE']} 
+                    {'date': elem.date, f"RFT:{elem.well}": elem['PRESSURE']}
                             for elem in rft_values]).set_index('date')
-                rft_df.index = pd.to_datetime(rft_df.index) # ensure datetime index for merging
+                rft_df.index = pd.to_datetime(rft_df.index)  # ensure datetime index for merging
+
+                # We only want to concatenate duplicate indices that are present in all_ecl_data.
+                # Any RFT-only timestamps are not relevant for assimilation and will be ignored.
+                all_idx = pd.to_datetime(all_ecl_data.index)
+
+                def _concat_non_null(s: pd.Series) -> object:
+                    """Concatenate multiple non-null entries in a group.
+
+                    Some RFT readers can yield array-like values; in that case `pd.notna(v)` returns
+                    an array of booleans which can't be used in an `if`.
+                    """
+                    def _is_null(v: object) -> bool:
+                        # Treat None/NaN as null, but don't choke on array-like values.
+                        if v is None:
+                            return True
+                        # numpy scalar NaN
+                        try:
+                            if isinstance(v, (float, np.floating)) and np.isnan(v):
+                                return True
+                        except Exception:
+                            pass
+                        return False
+
+                    def _to_text(v: object) -> str:
+                        # Make array-like values printable and stable.
+                        if isinstance(v, (list, tuple, np.ndarray)):
+                            a = np.asarray(v)
+                            return np.array2string(a, separator=',', max_line_width=10_000)
+                        return str(v)
+
+                    vals = [v for v in s.tolist() if not _is_null(v)]
+                    if not vals:
+                        return np.nan
+                    if len(vals) == 1:
+                        return vals[0]
+                    return ';'.join(_to_text(v) for v in vals)
+
+                # Split into overlapping + non-overlapping timestamps
+                rft_overlap = rft_df[rft_df.index.isin(all_idx)]
+                rft_other = rft_df[~rft_df.index.isin(all_idx)]
+
+                # Only for overlapping timestamps: concatenate duplicate rows per timestamp
+                if not rft_overlap.empty and not rft_overlap.index.is_unique:
+                    rft_overlap = rft_overlap.groupby(level=0, sort=True).agg(_concat_non_null)
+
+                # For non-overlapping timestamps: just de-duplicate deterministically (keep last)
+                if not rft_other.empty and not rft_other.index.is_unique:
+                    rft_other = rft_other[~rft_other.index.duplicated(keep='last')]
+
+                # Recombine and then align strictly to all_ecl_data's index (drop RFT-only times)
+                rft_df = pd.concat([rft_overlap, rft_other], axis=0).sort_index()
+                rft_df = rft_df.reindex(all_idx)
+
                 all_ecl_data = pd.concat([all_ecl_data, rft_df], axis=1)
         except FileNotFoundError:
             # This is ok, no RFT data found.
