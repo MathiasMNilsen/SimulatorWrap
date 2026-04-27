@@ -14,7 +14,7 @@ TITLE
 
 DIMENS
 -- NDIVIX NDIVIY NDIVIZ
-   100    100      1 /
+   100    100      2 /
 
 -- Gradient option
 -- AJGRADNT
@@ -25,6 +25,10 @@ DIMENS
 --BLACKOIL
 OIL
 WATER
+
+-- UNIFIED FORMAT
+UNIFIN
+UNIFOUT
 
 METRIC
 
@@ -38,7 +42,7 @@ EQLDIMS
 
 WELLDIMS
 -- NWMAXZ NCWMAX NGMAXZ MWGMAX 
-    10     1     2      20 /
+    10     2     2      20 /
 
 VFPPDIMS
 -- MXMFLO MXMTHP MXMWFR MXMGFR MXMALQ NMMVFT
@@ -74,17 +78,17 @@ COPY
 /
 
 DX
- 10000*10 /
+ 20000*10 /
 DY
- 10000*10 /
+ 20000*10 /
 DZ
- 10000*10 /
+ 20000*10 /
 
 TOPS
  10000*2355 /
 
 PORO
- 10000*0.18 /
+ 20000*0.18 /
 
 
 PROPS    ===============================================================
@@ -203,9 +207,9 @@ WELSPECS
 /
 COMPDAT
 --                                        RADIUS    SKIN
-'INJ-1'     1    1   1   1   'OPEN'   2*  0.15  1*  5.0 /
-'INJ-2'    100    1   1   1   'OPEN'   2*  0.15  1*  5.0 /
-'PRO-1'    100   100   1   1   'OPEN'   2*  0.15  1*  5.0 /
+'INJ-1'     1    1   1   2   'OPEN'   2*  0.15  1*  5.0 /
+'INJ-2'    100    1   1   2   'OPEN'   2*  0.15  1*  5.0 /
+'PRO-1'    100   100   1   2   'OPEN'   2*  0.15  1*  5.0 /
 /
 
 WCONINJE
@@ -224,10 +228,13 @@ WCONPROD
 --------------------- PRODUCTION SCHEDULE ----------------------------
 
 
-
 DATES
   1 JAN 1995 /
   /
+
+WRFT
+PRO-1 /
+/
 
 DATES                                  -- Generated : Petrel
   1 JAN 1996 /
@@ -236,6 +243,9 @@ DATES                                  -- Generated : Petrel
 DATES                                  -- Generated : Petrel
   1 JAN 1997 /
   /
+WRFT
+PRO-1 /
+/
 
 DATES                                  -- Generated : Petrel
   1 JAN 1998 /
@@ -244,6 +254,10 @@ DATES                                  -- Generated : Petrel
 DATES                                  -- Generated : Petrel
   1 JAN 1999 /
   /
+
+WRFT
+PRO-1 /
+/
 
 
 

@@ -20,6 +20,9 @@ dependencies = [
   "scikit-learn",
   "jutuldarcy",
   "pandas",
+  "resdata",
+  "resfo_utilities",
+  "libecalc==8.23.1", # pin version to avoid frequent modifications
 ]
 
 [project.urls]

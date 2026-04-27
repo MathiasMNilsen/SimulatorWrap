@@ -40,7 +40,8 @@ input_dict = {'parallel':2,
                 "fopt",
                 "fgpt",
                 "fwpt",
-                "fwit"],
+                "fwit",
+                "rft:pro-1"],
              'runfile':'3well'}
 
 # name of the runfile
@@ -79,34 +80,38 @@ pred
 ```
 
 
-
-
-    [{'fopt': array([[0.]]),
-      'fgpt': array([[0.]]),
-      'fwpt': array([[0.]]),
-      'fwit': array([[0.]])},
-     {'fopt': array([131.0504], dtype=float32),
-      'fgpt': array([0.], dtype=float32),
-      'fwpt': array([0.48596448], dtype=float32),
-      'fwit': array([242.00461], dtype=float32)},
-     {'fopt': array([276.51306], dtype=float32),
-      'fgpt': array([0.], dtype=float32),
-      'fwpt': array([0.857482], dtype=float32),
-      'fwit': array([463.29108], dtype=float32)},
-     {'fopt': array([420.74808], dtype=float32),
-      'fgpt': array([0.], dtype=float32),
-      'fwpt': array([1.1765413], dtype=float32),
-      'fwit': array([675.35266], dtype=float32)},
-     {'fopt': array([564.2478], dtype=float32),
-      'fgpt': array([0.], dtype=float32),
-      'fwpt': array([1.4610703], dtype=float32),
-      'fwit': array([891.02484], dtype=float32)},
-     {'fopt': array([707.78033], dtype=float32),
-      'fgpt': array([0.], dtype=float32),
-      'fwpt': array([1.720426], dtype=float32),
-      'fwit': array([1110.3655], dtype=float32)}]
-
-
+    [{
+        'fopt': array(1.34704602),
+        'fgpt': array(0.),
+        'fwpt': array(0.00086854),
+        'fwit': array(2.7143116),
+        'rft:pro-1': array(nan)},
+        {'fopt': array(277.52658081),
+        'fgpt': array(0.),
+        'fwpt': array(0.77613616),
+        'fwit': array(480.96279907),
+        'rft:pro-1': array([161.88829, 162.72838], dtype='>f4')},
+        {'fopt': array(573.01849365),
+        'fgpt': array(0.),
+        'fwpt': array(1.46081805),
+        'fwit': array(923.75933838),
+        'rft:pro-1': array(nan)},
+        {'fopt': array(866.71929932),
+        'fgpt': array(0.),
+        'fwpt': array(2.07612634),
+        'fwit': array(1355.08740234),
+        'rft:pro-1': array([160.21707, 161.05704], dtype='>f4')},
+        {'fopt': array(1156.9161377),
+        'fgpt': array(0.),
+        'fwpt': array(2.6172893),
+        'fwit': array(1787.93688965),
+        'rft:pro-1': array(nan)},
+        {'fopt': array(1445.58898926),
+        'fgpt': array(0.),
+        'fwpt': array(3.12104678),
+        'fwit': array(2229.38110352),
+        'rft:pro-1': array([159.58162, 160.4215 ], dtype='>f4')
+        }]
 
 
 ```python
@@ -173,3 +178,26 @@ plt.ylabel('STB');
 <img src="./Example/README_14_0.png">
 </h1><br>
 
+
+```python
+import matplotlib.dates as mdates
+
+plt.figure(figsize=(10, 6))
+ax = plt.gca()
+for reportpoint, rft_values in zip(input_dict['reportpoint'], [el['rft:pro-1'] for el in pred]):
+    rft_values = np.asarray(rft_values).flatten()
+    if rft_values.size == 1 and np.isnan(rft_values[0]):
+        continue
+    rft_values = rft_values[~np.isnan(rft_values)]
+    if rft_values.size == 0:
+        continue
+    ax.plot([reportpoint] * rft_values.size, rft_values, color='C0')
+ax.set_xlim(dt.datetime(input_dict['reportpoint'][0].year, 1, 1), max(input_dict['reportpoint']) + dt.timedelta(days=30))
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.set_title('RFT PRO-1');ax.set_xlabel('Report dates');ax.set_ylabel('Bar');
+```
+
+<h1 align="center">
+<img src="./Example/README_15_0.png">
+</h1><br>

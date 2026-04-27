@@ -10,11 +10,14 @@ from multiprocessing import Process
 import datetime as dt
 from scipy import interpolate
 from subprocess import call, DEVNULL
-from misc import ecl, grdecl
+from .misc import ecl, grdecl
 from shutil import rmtree, copytree  # rmtree for removing folders
 import time
 # import rips
 from glob import glob
+from resdata.summary import Summary
+from resfo_utilities import RFTReader
+import pandas as pd
 
 # Internal imports
 from misc.system_tools.environ_var import EclipseRunEnvironment
@@ -119,6 +122,8 @@ class eclipse:
         # Extract sim options
         simoptions = self.input_dict.get('simoptions', {})
         if isinstance(simoptions, list):
+            if not all(isinstance(item, list) for item in simoptions):
+                simoptions = [simoptions]
             simoptions = list_to_dict(simoptions)
 
         self.options = {}
@@ -360,18 +365,101 @@ class eclipse:
                       dt.datetime.now().strftime("%m-%d-%Y_%H-%M-%S"))
 
     def extract_data(self, member):
-        # get the formated data
-        for prim_ind in self.l_prim:
-            # Loop over all keys in pred_data (all data types)
-            for key in self.all_data_types:
-                if self.pred_data[prim_ind][key] is not None:  # Obs. data at assim. step
-                    true_data_info = [self.true_prim[0], self.true_prim[1][prim_ind]]
-                    try:
-                        data_array = self.get_sim_results(key, true_data_info, member)
-                        self.pred_data[prim_ind][key] = data_array
-                    except:
-                        print(f'Failed to extract {key} at {prim_ind} for member {member}')
-                        pass
+        # Generate dataframe
+        # For now we use resdata. Migrate to resfo_utilities if possible, but this is not a priority.
+        case = Summary('En_' + str(member) + os.sep + self.file)
+        if self.true_prim[0] == 'days':
+            dt_times = [case.start_time + dt.timedelta(days=el) for el in self.true_prim[1]]
+            all_ecl_data = case.pandas_frame(time_index=dt_times)  # Get all
+        else:
+            all_ecl_data = case.pandas_frame(time_index=self.true_prim[1]) # This will interpolate is report is missing, or is slighly off.
+        
+        # Extract RFT data if present
+        try:
+            with RFTReader.open('En_' + str(member) + os.sep + self.file) as rft:
+                rft_values = list(rft)
+                rft_df = pd.DataFrame([
+                    {'date': elem.date, f"RFT:{elem.well}": elem['PRESSURE']}
+                            for elem in rft_values]).set_index('date')
+                rft_df.index = pd.to_datetime(rft_df.index)  # ensure datetime index for merging
+
+                # We only want to concatenate duplicate indices that are present in all_ecl_data.
+                # Any RFT-only timestamps are not relevant for assimilation and will be ignored.
+                all_idx = pd.to_datetime(all_ecl_data.index)
+
+                def _concat_non_null(s: pd.Series) -> object:
+                    """Concatenate multiple non-null entries in a group.
+
+                    Some RFT readers can yield array-like values; in that case `pd.notna(v)` returns
+                    an array of booleans which can't be used in an `if`.
+                    """
+                    def _is_null(v: object) -> bool:
+                        # Treat None/NaN as null, but don't choke on array-like values.
+                        if v is None:
+                            return True
+                        # numpy scalar NaN
+                        try:
+                            if isinstance(v, (float, np.floating)) and np.isnan(v):
+                                return True
+                        except Exception:
+                            pass
+                        return False
+
+                    def _to_text(v: object) -> str:
+                        # Make array-like values printable and stable.
+                        if isinstance(v, (list, tuple, np.ndarray)):
+                            a = np.asarray(v)
+                            return np.array2string(a, separator=',', max_line_width=10_000)
+                        return str(v)
+
+                    vals = [v for v in s.tolist() if not _is_null(v)]
+                    if not vals:
+                        return np.nan
+                    if len(vals) == 1:
+                        return vals[0]
+                    return ';'.join(_to_text(v) for v in vals)
+
+                # Split into overlapping + non-overlapping timestamps
+                rft_overlap = rft_df[rft_df.index.isin(all_idx)]
+                rft_other = rft_df[~rft_df.index.isin(all_idx)]
+
+                # Only for overlapping timestamps: concatenate duplicate rows per timestamp
+                if not rft_overlap.empty and not rft_overlap.index.is_unique:
+                    rft_overlap = rft_overlap.groupby(level=0, sort=True).agg(_concat_non_null)
+
+                # For non-overlapping timestamps: just de-duplicate deterministically (keep last)
+                if not rft_other.empty and not rft_other.index.is_unique:
+                    rft_other = rft_other[~rft_other.index.duplicated(keep='last')]
+
+                # Recombine and then align strictly to all_ecl_data's index (drop RFT-only times)
+                rft_df = pd.concat([rft_overlap, rft_other], axis=0).sort_index()
+                rft_df = rft_df.reindex(all_idx)
+
+                all_ecl_data = pd.concat([all_ecl_data, rft_df], axis=1)
+        except FileNotFoundError:
+            # This is ok, no RFT data found.
+            pass
+        # reformat to PIPT structure. Note that some data might not be present in all_data. E.g. seismic data
+        # Convert DataFrame rows to list of dictionaries
+        for i, (_, row) in enumerate(all_ecl_data.iterrows()):
+            # Create a case-insensitive column lookup
+            col_map = {col.upper(): col for col in all_ecl_data.columns}
+            record = {key: row[col_map[key.upper()]] if key.upper() in col_map else None for key in self.all_data_types}
+            self.pred_data[i] = record
+
+    # def extract_data(self, member):
+    #     # get the formated data
+    #     for prim_ind in self.l_prim:
+    #         # Loop over all keys in pred_data (all data types)
+    #         for key in self.all_data_types:
+    #             if self.pred_data[prim_ind][key] is not None:  # Obs. data at assim. step
+    #                 true_data_info = [self.true_prim[0], self.true_prim[1][prim_ind]]
+    #                 try:
+    #                     data_array = self.get_sim_results(key, true_data_info, member)
+    #                     self.pred_data[prim_ind][key] = data_array
+    #                 except:
+    #                     print(f'Failed to extract {key} at {prim_ind} for member {member}')
+    #                     pass
 
     def coarsen(self, folder, ensembleMember=None):
         """
@@ -846,6 +934,10 @@ class eclipse:
         """
         # Check that we have no trailing spaces
         whichResponse = whichResponse.strip()
+        case = Summary('En_' + str(member) + os.sep + self.file)
+
+        # Extract all data as df and dump
+        return case.pandas_frame()
 
         # if ensemble DA method
         if member is not None:
