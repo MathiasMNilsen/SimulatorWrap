@@ -89,6 +89,8 @@ class JutulDarcy:
         self.report_type = options.get('reporttype', 'days') # days or dates
         self.report = options.get('reportpoint', None)       # list of days or dates (dates as datetime objects)
         self.index = [self.report_type, self.report]
+        self.report_seconds = None
+        self.start_date = None
 
         # Process datatypes
         datatype = options.get('datatype', ['FOPT', 'FGPT', 'FWPT', 'FWIT'])
@@ -242,7 +244,7 @@ class JutulDarcy:
 
         # Simulate and get results
         jlres = julia.simulate_reservoir(case, info_level=-1, output_substates=True)
-        pyres, daysIDX = self.extract_datatypes(jlres, case, units, julia)
+        pyres = self.extract_datatypes(jlres, case, units, julia)
         
         # Convert output to requested format
         if not self.output_format == 'dataframe':
@@ -292,33 +294,31 @@ class JutulDarcy:
             for col, info in pbar:
 
                 if info['steps'] == 'all': # If 'all', use same steps as forward simulation results
-                    stepIDX = daysIDX
+                    adjoint_seconds = self.report_seconds
+                    adjoint_index = self.index[1]
                 elif info['steps'] == 'acc':
-                    stepIDX = None
+                    adjoint_seconds = None
+                    adjoint_index = self.index[1][-1]
                 else:
-                    smry = julia.JutulDarcy.summary_result(case, jlres, units)
-                    sim_days = np.array(list(smry["TIME"].seconds)) / (24*60*60)
-                    sim_days = sim_days.astype(int)
-
+                    # DAYS
                     if isinstance(info['steps'][0], int):
-                        if not np.all(np.isin(info['steps'], sim_days)):
-                            raise ValueError(f'Steps {info["steps"]} not found in simulation results for objective {col}, Available steps: {sim_days}')
-                        stepIDX = np.argwhere(np.isin(sim_days, info['steps'])).flatten()
-                    
-                    elif isinstance(info['steps'][0], dt.datetime):
-                        start_date = case.input_data["RUNSPEC"]['START']
-                        sim_dates = np.array([start_date + dt.timedelta(days=int(d)) for d in sim_days])
-                        if not np.all(np.isin(info['steps'], sim_dates)):
-                            raise ValueError(f'Dates {info["steps"]} not found in simulation results for objective {col}, Available dates: {sim_dates}')
-                        stepIDX = np.argwhere(np.isin(sim_dates, info['steps'])).flatten()
-                
+                        adjoint_seconds = np.array(info['steps'], dtype=np.int64) * 24*60*60
+                        if not np.all(np.isin(adjoint_seconds, jlres.time)):
+                            raise ValueError(f'Steps {info["steps"]} not found in simulation results for objective {col}')
+                        adjoint_index = info['steps']
+
+                    # DATES
+                    if isinstance(info['steps'][0], dt.datetime):
+                        adjoint_seconds = np.array([(d - self.start_date).total_seconds() for d in info['steps']], dtype=np.int64)
+                        if not np.all(np.isin(adjoint_seconds, jlres.time)):
+                            raise ValueError(f'Dates {info["steps"]} not found in simulation results for objective {col}')
+                        adjoint_index = info['steps']
 
                 # Get QOI function for this objective
                 funcs = well_QOI_objective(
                     wellID=info['wellID'], 
                     phaseID=info['phase'], 
-                    stepID=stepIDX,
-                    time=np.array(jlres.time),
+                    time=adjoint_seconds,
                     rate=info['is_rate'], 
                     julia=julia
                 )
@@ -344,10 +344,12 @@ class JutulDarcy:
                     end
                     """)
 
-                    # Evaluate functions
-                    if self.eval_adjoint_funcs:
+                    # Evaluate function value for this objective at this time step and store in dict (for checking)
+                    double_check = True
+                    if double_check or self.eval_adjoint_funcs:
                         func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
                         func_val = func_val*julia.seval('si_unit(:day)') if info['is_rate'] else func_val
+                        assert func_val == pyres.loc[adjoint_index[i]][col]
                         func_dict[col].append(func_val)
 
 
@@ -368,7 +370,7 @@ class JutulDarcy:
 
             # Create adjoint dataframe with MultiIndex columns
             cols = pd.MultiIndex.from_tuples(grad_dict.keys())
-            adjoints = pd.DataFrame(grad_dict, columns=cols, index=self.index[1])
+            adjoints = pd.DataFrame(grad_dict, columns=cols, index=adjoint_index)
             adjoints.index.name = self.index[0]
             adjoints.attrs = {'units': units}
         # ----------------------------------------------------------------------------------------------
@@ -404,25 +406,19 @@ class JutulDarcy:
         # Summary
         smry = julia.JutulDarcy.summary_result(jlcase, jlres, jl_units)
 
-        # Start date
-        start_date = jlcase.input_data["RUNSPEC"]['START']
+        # Reportponts in seconds
+        sim_seconds = np.array(list(smry["TIME"].seconds), dtype=np.int64)
+        self.start_date = jlcase.input_data["RUNSPEC"]['START']
+        if self.index[0] == 'days':
+            self.report_seconds = np.array(self.index[1], dtype=np.int64) * 24*60*60
+        elif self.index[0] == 'dates':
+            self.report_seconds = np.array([(d - self.start_date).total_seconds() for d in self.index[1]], dtype=np.int64)
+        else:
+            raise ValueError(f"Invalid report type: {self.index[0]}. Must be 'days' or 'dates'.")
 
-        # Get report steps
-        report_days = []
-        sim_days = np.array(list(smry["TIME"].seconds), dtype=np.int64) / (24*60*60)
-        for d, sday in enumerate(sim_days):
-            if self.index[0] == 'days':
-                if sday in self.index[1]:
-                    report_days.append(int(sday))
-            elif self.index[0] == 'dates':
-                sim_date = start_date + dt.timedelta(days=sday)
-                if sim_date in self.index[1]:
-                    report_days.append(int(sday))
-            else:
-                raise ValueError(f"Invalid report type: {self.index[0]}. Must be 'days' or 'dates'.")
-
-        report_daysIDX = np.argwhere(np.isin(sim_days, report_days)).flatten()
-
+        # Index of report points in simulation output
+        self.report_index = np.argwhere(np.isin(sim_seconds, self.report_seconds)).flatten()
+    
         # Extract datatypes for step
         for datatype in self.datatype:  
             
@@ -437,7 +433,7 @@ class JutulDarcy:
                     raise ValueError(f"Well ID '{wellID}' not found in simulation results for datatype '{baseID}'")
                 
                 if baseID in data:
-                    res[datatype] = np.array(data[baseID])[report_daysIDX]
+                    res[datatype] = np.array(data[baseID])[self.report_index]
                     attrs[datatype] = get_metric_unit(baseID)
                 else:
                     raise ValueError(f"Datatype '{baseID}' not found for well '{wellID}' in simulation results")
@@ -447,7 +443,7 @@ class JutulDarcy:
                 jlres_field = smry["VALUES"]["FIELD"]
                 if datatype in jlres_field:
                     data = np.array(jlres_field[datatype])
-                    res[datatype] = data[report_daysIDX]
+                    res[datatype] = data[self.report_index]
                     attrs[datatype] = get_metric_unit(datatype)
                 else:
                     raise ValueError(f"Datatype '{datatype}' not found in field results of simulation")
@@ -459,7 +455,7 @@ class JutulDarcy:
         res.index.name = self.index[0]
         res.attrs = attrs
 
-        return res, report_daysIDX
+        return res
 
     
     def render_makofile(self, makofile: str, folder: str, input: dict):
@@ -585,7 +581,7 @@ def get_metric_unit(key: str) -> str:
     return unit_map.get(key.upper(), "Unknown")
 
 
-def well_QOI_objective(wellID, phaseID, stepID=None, time=None, rate=True, julia=None):
+def well_QOI_objective(wellID, phaseID, time=None, rate=True, julia=None):
     if julia is None:
         from juliacall import Main as julia
         julia.seval("using JutulDarcy")
@@ -604,7 +600,7 @@ def well_QOI_objective(wellID, phaseID, stepID=None, time=None, rate=True, julia
         raise ValueError(f"Unknown rate type: {phaseID}")
     rateID_symbol = rateID_map[phaseID]
 
-    if stepID is None:
+    if time is None:
         julia.seval(
             f"""
             function well_QOI(model, state, dt, step_i, forces)
@@ -629,13 +625,13 @@ def well_QOI_objective(wellID, phaseID, stepID=None, time=None, rate=True, julia
         )
         return julia.well_QOI
 
-    if isinstance(stepID, (list, np.ndarray)):
+    if isinstance(time, (list, np.ndarray)):
         qois = []
-        for sID in stepID:
-            julia.seval(
+        for s, sec in enumerate(time):
+            obj = julia.seval(
                 f"""
-                function well_QOI_{sID}(model, state, dt, step_i, forces)
-                    if (step_i[:step] != {sID+1}) && (step_i[:time] != {time[sID+1]})
+                function well_QOI_{s}(model, state, dt, step_i, forces)
+                    if step_i[:time] != {sec}
                         return 0.0
                     else
                         ctrl = forces[:Facility].control[Symbol("{wellID}")]
@@ -658,13 +654,13 @@ def well_QOI_objective(wellID, phaseID, stepID=None, time=None, rate=True, julia
                 end
                 """
             )
-            qois.append(julia.seval(f"well_QOI_{sID}"))
+            qois.append(obj)
         return qois
 
     julia.seval(
         f"""
         function well_QOI(model, state, dt, step_i, forces)
-            if (step_i[:step] != {stepID+1}) && (step_i[:time] != {time[stepID+1]})
+            if step_i[:time] != {time}
                 return 0.0
             else
                 ctrl = forces[:Facility].control[Symbol("{wellID}")]
