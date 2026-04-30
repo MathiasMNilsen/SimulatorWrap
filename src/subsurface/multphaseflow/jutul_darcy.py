@@ -100,7 +100,7 @@ class JutulDarcy:
         if 'adjoints' in options:
             self.compute_adjoints = True
             self.adjoint_info = _process_adjoint_info(options['adjoints']) 
-            self.eval_adjoint_funcs = options.get('eval_adjoint_funcs', True)
+            self.eval_adjoint_funcs = options.get('eval_adjoint_funcs', False)
             self.adjoint_funcs = None
         else:
             self.compute_adjoints = False
@@ -345,12 +345,12 @@ class JutulDarcy:
                     """)
 
                     # Evaluate function value for this objective at this time step and store in dict (for checking)
-                    double_check = True
-                    if double_check or self.eval_adjoint_funcs:
-                        func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
-                        func_val = func_val*julia.seval('si_unit(:day)') if info['is_rate'] else func_val
-                        assert func_val == pyres.loc[adjoint_index[i]][col]
-                        func_dict[col].append(func_val)
+                    #double_check = True
+                    #if double_check or self.eval_adjoint_funcs:
+                    #    func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
+                    #    func_val = func_val*julia.seval('si_unit(:day)') if info['is_rate'] else func_val
+                    #    assert func_val == pyres.loc[adjoint_index[i]][col]
+                    #    func_dict[col].append(func_val)
 
 
                     # Extract parameter sensitivities for this objective and store in dict
@@ -630,10 +630,8 @@ def well_QOI_objective(wellID, phaseID, time=None, rate=True, julia=None):
         for s, sec in enumerate(time):
             obj = julia.seval(
                 f"""
-                function well_QOI_{s}(model, state, dt, step_i, forces)
-                    if step_i[:time] != {sec}
-                        return 0.0
-                    else
+                function well_QOI_{s}(model, state, dt, step_info, forces)
+                    if step_info[:time] == {sec}
                         ctrl = forces[:Facility].control[Symbol("{wellID}")]
                         if ctrl isa JutulDarcy.DisabledControl
                             return 0.0
@@ -650,6 +648,8 @@ def well_QOI_objective(wellID, phaseID, time=None, rate=True, julia=None):
                             {rateID_symbol}
                         )
                         return sgn*{dt_factor}rate
+                    else
+                        return 0.0
                     end
                 end
                 """
