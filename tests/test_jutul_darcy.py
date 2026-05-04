@@ -58,7 +58,7 @@ def run_simulation_with_adjoint(tmp_path_factory, options):
         'WOPR': {
             'steps': [datetime(2032, 12, 14)],
             'wellID': 'PRO2',
-            'parameters': 'log_permx'
+            'parameters': ['log_permx', 'permx']
         }
     }
 
@@ -125,6 +125,20 @@ class TestJutulDarcyGradient:
         # Check that gradient contains expected time steps
         for index in gradient.index:
             assert index in options['reportpoint'], f"Missing expected time step in gradient: {index}"
+    
+    def test_gradient_consistency(self, run_simulation_with_adjoint):
+        """Test that the gradient with respect to log_permx is consistent with the gradient with respect to permx."""
+        results, gradient = run_simulation_with_adjoint
+        
+        # Extract gradients for log_permx and permx
+        grad_log_permx = gradient.loc[datetime(2032, 12, 14), ('WOPR:PRO2', 'log_permx')]
+        grad_permx = gradient.loc[datetime(2032, 12, 14), ('WOPR:PRO2', 'permx')]
+        
+        # Load original permx values
+        permx = np.load(_tiny_folder() / 'PERMX.npy')
+        
+        # Check consistency: grad_log_permx should equal grad_permx * permx
+        np.testing.assert_almost_equal(grad_log_permx, grad_permx * permx)
     
         
         
