@@ -1,9 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from datetime import datetime
 from subsurface.multphaseflow.jutul_darcy import JutulDarcy
 
+# Report steps
 datetimes = [
     datetime(2023, 2, 5),
     datetime(2024, 3, 11),
@@ -17,23 +17,28 @@ datetimes = [
     datetime(2032, 12, 14),
 ]
 
+# Data types to report
 datatype = [
-    'WOPR:PRO1', 'WOPR:PRO2', 'WOPR:PRO3', 
-    'WWPR:PRO1', 'WWPR:PRO2', 'WWPR:PRO3', 
-    'WWIR:INJ1'
+    'WOPR:PRO1', 
+    'WOPR:PRO2', 
+    'WOPR:PRO3', 
+    'WWPR:PRO1', 
+    'WWPR:PRO2', 
+    'WWPR:PRO3', 
 ]
 
+# Simulator settings and adjoint configuration
 kwargs = {
     'reporttype': 'dates',
     'reportpoint': datetimes,
     'runfile': 'RUNFILE.mako',
     'startdate': datetime(2022, 1, 1),
     'datatype': datatype,
-    'asjoint_pbar': True,
-    'adjoints': {'WOPR': {'steps': [datetime(2032, 12, 14)], 'wellID': 'PRO2', 'parameters': 'log_permx'}},
+    'adjoint_pbar': True,
+    'adjoints': {'WOPR': 
+        {'steps': [datetime(2032, 12, 14)], 'wellID': 'PRO2', 'parameters': ['log_permx', 'permx']},
+    },
 }
-
-
 
 def simulate():
     log_permx = np.log(np.load('PERMX.npy'))
@@ -154,12 +159,16 @@ def plot_permx():
     cbar = plt.colorbar(sm, cax=cbar_ax, orientation='horizontal')
     cbar.set_label('Permeability (mD)', fontsize=11, fontweight='bold')
 
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    ax.set_zticklabels([])
+
     ax.view_init(elev=20, azim=45)
     ax.set_box_aspect([nx/10, ny/10, nz/10])
     fig.savefig('permx.png', dpi=300, bbox_inches='tight')
 
 
-def plot_gradient(grad):
+def plot_gradient(grad, savename='gradient_log_permx.png'):
     nx, ny, nz = 10, 10, 2
     grad = grad.reshape((nx, ny, nz), order='F')
 
@@ -234,10 +243,6 @@ def plot_gradient(grad):
 
     ax.set_zlim(0.0, 1.0 + stick_extra_above + 0.05)
     
-    # Enhanced styling
-    ax.set_xlabel('x', fontsize=12, fontweight='bold')
-    ax.set_ylabel('y', fontsize=12, fontweight='bold')
-    ax.set_zlabel('z', fontsize=12, fontweight='bold')
     
     # Add horizontal colorbar below the plot
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=grad.min(), vmax=grad.max()))
@@ -246,14 +251,19 @@ def plot_gradient(grad):
     cbar = plt.colorbar(sm, cax=cbar_ax, orientation='horizontal')
     cbar.set_label('Gradient of log-PERMX (Sm3/day)', fontsize=11, fontweight='bold')
     
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    ax.set_zticklabels([])
+
     # View angle
     ax.view_init(elev=20, azim=45)
     ax.set_box_aspect([nx/10, ny/10, nz/10])
     plt.show()
-    fig.savefig('gradient.png', dpi=300, bbox_inches='tight')
+    fig.savefig(savename, dpi=300, bbox_inches='tight')
 
 
 if __name__ == "__main__":
+
     # Visualize permeability field
     plot_permx()
     
@@ -263,8 +273,14 @@ if __name__ == "__main__":
     print(gradient)
     
     # Plot gradient field for report time step
-    grad = gradient.iloc[0][('WOPR:PRO2', 'log_permx')]  # Get gradient for first time step
-    plot_gradient(grad)
+    grad = gradient.loc[datetime(2032, 12, 14), ('WOPR:PRO2', 'log_permx')] 
+    plot_gradient(grad, savename='gradient_log_permx.png')
 
-    # Plot production results
+    # Plot production rates
     plot(results)
+
+    # Test that gradient with respect to log_permx is consistent with gradient with respect to permx
+    permx = np.load('PERMX.npy')
+    grad_permx = gradient.loc[datetime(2032, 12, 14), ('WOPR:PRO2', 'permx')]
+    grad_log_permx = gradient.loc[datetime(2032, 12, 14), ('WOPR:PRO2', 'log_permx')]
+    np.testing.assert_almost_equal(grad_log_permx, grad_permx * permx)

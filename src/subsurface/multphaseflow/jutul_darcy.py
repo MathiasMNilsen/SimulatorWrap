@@ -36,6 +36,13 @@ PBAR_OPTS = {
 }
 
 
+SECONDS_PER_DAY = 24 * 60 * 60
+CUMULATIVE_KEYS = {
+    "FOPT", "FGPT", "FWPT", "FWLT", "FWIT",
+    "WOPT", "WGPT", "WWPT", "WLPT",
+}
+
+
 class JutulDarcy:
 
     def __init__(self, options: dict):
@@ -251,11 +258,7 @@ class JutulDarcy:
             if self.output_format == 'dict':
                 output = pyres.to_dict(orient='list')
             elif self.output_format == 'list':
-                output = []
-                for _, row in pyres.iterrows():
-                    row_dict = row.to_dict()
-                    row_dict = {k: np.atleast_1d(v) for k, v in row_dict.items()}
-                    output.append(row_dict)
+                output = pyres.to_dict(orient='records')
         else:
             output = pyres
 
@@ -294,32 +297,29 @@ class JutulDarcy:
             for col, info in pbar:
 
                 if info['steps'] == 'all': # If 'all', use same steps as forward simulation results
-                    adjoint_seconds = self.report_seconds
                     adjoint_index = self.index[1]
-                elif info['steps'] == 'acc':
-                    adjoint_seconds = None
-                    adjoint_index = self.index[1][-1]
+                    adjoint_seconds = self.report_seconds
                 else:
                     # DAYS
                     if isinstance(info['steps'][0], int):
-                        adjoint_seconds = np.array(info['steps'], dtype=np.int64) * 24*60*60
-                        if not np.all(np.isin(adjoint_seconds, jlres.time)):
-                            raise ValueError(f'Steps {info["steps"]} not found in simulation results for objective {col}')
+                        adjoint_seconds = np.array(info['steps'], dtype=np.int64) * (24*60*60)
                         adjoint_index = info['steps']
 
                     # DATES
-                    if isinstance(info['steps'][0], dt.datetime):
+                    elif isinstance(info['steps'][0], dt.datetime):
                         adjoint_seconds = np.array([(d - self.start_date).total_seconds() for d in info['steps']], dtype=np.int64)
-                        if not np.all(np.isin(adjoint_seconds, jlres.time)):
-                            raise ValueError(f'Dates {info["steps"]} not found in simulation results for objective {col}')
                         adjoint_index = info['steps']
+
+                # Map each target time to its 1-based report step index in jlres
+                adjoint_step_idx = [int(np.argmin(np.abs(np.array(jlres.time) - s))) + 1 for s in adjoint_seconds]
 
                 # Get QOI function for this objective
                 funcs = well_QOI_objective(
-                    wellID=info['wellID'], 
-                    phaseID=info['phase'], 
-                    time=adjoint_seconds,
-                    rate=info['is_rate'], 
+                    info['wellID'], 
+                    info['phase'], 
+                    adjoint_seconds,
+                    adjoint_step_idx,
+                    info['is_rate'], 
                     julia=julia
                 )
 
@@ -345,12 +345,19 @@ class JutulDarcy:
                     """)
 
                     # Evaluate function value for this objective at this time step and store in dict (for checking)
-                    #double_check = True
-                    #if double_check or self.eval_adjoint_funcs:
-                    #    func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
-                    #    func_val = func_val*julia.seval('si_unit(:day)') if info['is_rate'] else func_val
-                    #    assert func_val == pyres.loc[adjoint_index[i]][col]
-                    #    func_dict[col].append(func_val)
+                    func_val = None
+                    double_check = True
+                    if double_check:
+                        func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
+                        msg = f'func_val: {func_val:.3e}, pyres: {pyres.loc[adjoint_index[i]][col]:.3e}'
+                        assert np.isclose(func_val, pyres.loc[adjoint_index[i]][col]), msg
+                    
+                    if self.eval_adjoint_funcs:
+                        if func_val is not None:
+                            func_dict[col].append(func_val)
+                        else:
+                            func_val = julia.Jutul.evaluate_objective(func, case, jlres.result)
+                            func_dict[col].append(func_val)
 
 
                     # Extract parameter sensitivities for this objective and store in dict
@@ -409,15 +416,16 @@ class JutulDarcy:
         # Reportponts in seconds
         sim_seconds = np.array(list(smry["TIME"].seconds), dtype=np.int64)
         self.start_date = jlcase.input_data["RUNSPEC"]['START']
+
         if self.index[0] == 'days':
-            self.report_seconds = np.array(self.index[1], dtype=np.int64) * 24*60*60
+            self.report_seconds = np.array(self.index[1], dtype=np.int64) * SECONDS_PER_DAY
         elif self.index[0] == 'dates':
             self.report_seconds = np.array([(d - self.start_date).total_seconds() for d in self.index[1]], dtype=np.int64)
         else:
             raise ValueError(f"Invalid report type: {self.index[0]}. Must be 'days' or 'dates'.")
 
         # Index of report points in simulation output
-        self.report_index = np.argwhere(np.isin(sim_seconds, self.report_seconds)).flatten()
+        idx = np.argwhere(np.isin(sim_seconds, self.report_seconds)).flatten()
     
         # Extract datatypes for step
         for datatype in self.datatype:  
@@ -433,7 +441,8 @@ class JutulDarcy:
                     raise ValueError(f"Well ID '{wellID}' not found in simulation results for datatype '{baseID}'")
                 
                 if baseID in data:
-                    res[datatype] = np.array(data[baseID])[self.report_index]
+                    values = np.array(data[baseID])[idx]
+                    res[datatype] = values
                     attrs[datatype] = get_metric_unit(baseID)
                 else:
                     raise ValueError(f"Datatype '{baseID}' not found for well '{wellID}' in simulation results")
@@ -443,7 +452,7 @@ class JutulDarcy:
                 jlres_field = smry["VALUES"]["FIELD"]
                 if datatype in jlres_field:
                     data = np.array(jlres_field[datatype])
-                    res[datatype] = data[self.report_index]
+                    res[datatype] = data[idx]
                     attrs[datatype] = get_metric_unit(datatype)
                 else:
                     raise ValueError(f"Datatype '{datatype}' not found in field results of simulation")
@@ -491,9 +500,6 @@ def _extract_adjoint(jlgrad, jlcase, parameter, actnum, is_rate, julia):
             adjoint = adjoint * julia.seval('si_unit(:milli)*si_unit(:darcy)')
     else:
         raise ValueError(f"Adjoint not implemented for parameter '{parameter}'")
-    
-    if is_rate:
-        adjoint = adjoint * julia.seval('si_unit(:day)')  # Convert from per sec to per day
 
     return adjoint
         
@@ -581,12 +587,10 @@ def get_metric_unit(key: str) -> str:
     return unit_map.get(key.upper(), "Unknown")
 
 
-def well_QOI_objective(wellID, phaseID, time=None, rate=True, julia=None):
+def well_QOI_objective(wellID, phaseID, time=None, step_index=None, is_rate=True, julia=None):
     if julia is None:
         from juliacall import Main as julia
         julia.seval("using JutulDarcy")
-
-    dt_factor = "" if rate else "dt*"
 
     rateID_map = {
         "mass"   : "TotalSurfaceMassRate",
@@ -600,87 +604,36 @@ def well_QOI_objective(wellID, phaseID, time=None, rate=True, julia=None):
         raise ValueError(f"Unknown rate type: {phaseID}")
     rateID_symbol = rateID_map[phaseID]
 
-    if time is None:
-        julia.seval(
-            f"""
-            function well_QOI(model, state, dt, step_i, forces)
-                ctrl = forces[:Facility].control[Symbol("{wellID}")]
-                if ctrl isa JutulDarcy.DisabledControl
-                    return 0.0
-                elseif ctrl isa JutulDarcy.ProducerControl
-                    sgn = -1.0
-                else
-                    sgn = 1.0
-                end
-                rate = JutulDarcy.compute_well_qoi(
-                    model,
-                    state,
-                    forces,
-                    Symbol("{wellID}"),
-                    {rateID_symbol}
-                )
-                return sgn*{dt_factor}rate
-            end
-            """
-        )
-        return julia.well_QOI
-
-    if isinstance(time, (list, np.ndarray)):
-        qois = []
-        for s, sec in enumerate(time):
+    qois = []
+    for i, sec in enumerate(time):
+        if is_rate:
             obj = julia.seval(
                 f"""
-                function well_QOI_{s}(model, state, dt, step_info, forces)
-                    if step_info[:time] == {sec}
-                        ctrl = forces[:Facility].control[Symbol("{wellID}")]
-                        if ctrl isa JutulDarcy.DisabledControl
-                            return 0.0
-                        elseif ctrl isa JutulDarcy.ProducerControl
-                            sgn = -1.0
-                        else
-                            sgn = 1.0
-                        end
-                        rate = JutulDarcy.compute_well_qoi(
-                            model,
-                            state,
-                            forces,
-                            Symbol("{wellID}"),
-                            {rateID_symbol}
-                        )
-                        return sgn*{dt_factor}rate
-                    else
+                function well_QOI_{i}(model, state, dt, step_info, forces)
+                    if step_info[:time] != {sec}
                         return 0.0
                     end
+                    ctrl = forces[:Facility].control[Symbol("{wellID}")]
+                    sign = ctrl isa JutulDarcy.ProducerControl ? -1.0 : 1.0
+                    rate = JutulDarcy.compute_well_qoi(model, state, forces, Symbol("{wellID}"), {rateID_symbol})
+                    return sign * rate * si_unit(:day) # rate is in Sm3/s: convert to Sm3/day
                 end
                 """
             )
-            qois.append(obj)
-        return qois
-
-    julia.seval(
-        f"""
-        function well_QOI(model, state, dt, step_i, forces)
-            if step_i[:time] != {time}
-                return 0.0
-            else
-                ctrl = forces[:Facility].control[Symbol("{wellID}")]
-                if ctrl isa JutulDarcy.DisabledControl
-                    return 0.0
-                elseif ctrl isa JutulDarcy.ProducerControl
-                    sgn = -1.0
-                else
-                    sgn = 1.0
+        else:
+            obj = julia.seval(
+                f"""
+                function well_QOI_{i}(model, state, dt, step_info, forces)
+                    if step_info[:time] > {sec}
+                        return 0.0
+                    end
+                    ctrl = forces[:Facility].control[Symbol("{wellID}")]
+                    sign = ctrl isa JutulDarcy.ProducerControl ? -1.0 : 1.0
+                    rate = JutulDarcy.compute_well_qoi(model, state, forces, Symbol("{wellID}"), {rateID_symbol})
+                    return sign * dt * rate
                 end
-                rate = JutulDarcy.compute_well_qoi(
-                    model,
-                    state,
-                    forces,
-                    Symbol("{wellID}"),
-                    {rateID_symbol}
-                )
-                return sgn*{dt_factor}rate
-            end
-        end
-        """
-    )
-    return julia.well_QOI
+                """
+            )
+        qois.append(obj)
+
+    return qois

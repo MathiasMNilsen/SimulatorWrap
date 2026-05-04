@@ -6,107 +6,130 @@ from datetime import datetime
 from subsurface.multphaseflow.jutul_darcy import JutulDarcy
 from misc.structures import PETDataFrame, PETStateArray 
 
-datetimes = [
-    datetime(2023, 2, 5),
-    datetime(2024, 3, 11),
-    datetime(2025, 4, 15),
-    datetime(2026, 5, 20),
-    datetime(2027, 6, 24),
-    datetime(2028, 7, 28),
-    datetime(2029, 9, 1),
-    datetime(2030, 10, 6),
-    datetime(2031, 11, 10),
-    datetime(2032, 12, 14),
-]
 
-datatype = [
-    'WOPR:PRO1', 'WOPR:PRO2', 'WOPR:PRO3', 
-    'WWPR:PRO1', 'WWPR:PRO2', 'WWPR:PRO3', 
-    'WWIR:INJ1'
-]
-
-kwargs = {
-    'parallel': 5,
-    'reporttype': 'dates',
-    'reportpoint': datetimes,
-    'runfile': 'RUNFILE.mako',
-    'startdate': datetime(2022, 1, 1),
-    'datatype': datatype,
-    'adjoint_pbar': False,
-    'adjoints': {'WOPR': {'steps': [datetime(2032, 12, 14)], 'wellID': 'PRO2', 'parameters': 'log_permx'}},
-}
-
-def test_finit_diff(calc_finite_diff=True, calc_adjoint=True):
-    os.makedirs('TEST/FD', exist_ok=True)
-
-    nc = 5
-    eps = 1e-4
-
-    log_permx = np.log(np.load('PERMX.npy'))
-
-    # ----------------------------
-    # FINITE-DIFFERENCE GRADIENT
-    # ----------------------------
-    if calc_finite_diff:
-        kwargs_copy = dict(kwargs)  # Avoid mutating original kwargs
-        kwargs_copy.pop('adjoints', None)  # Remove adjoint options for finite-difference run
-        simulator = JutulDarcy(kwargs_copy)
-
-        # Compute finite-difference gradient
-        log_perm_minus = np.tile(log_permx[:, None], (1, nc))
-        log_perm_plus  = np.tile(log_permx[:, None], (1, nc))
-        
-        for i in range(nc):
-            log_perm_minus[i, i] -= eps
-            log_perm_plus[i, i]  += eps
-
-        
-                # Minus ensemble
-        inputs_minus = [{'log_permx': log_perm_minus[:, i]} for i in range(nc)]
-        out_minus = simulator(inputs_minus)
-        df_minus = PETDataFrame.merge_dataframes(out_minus)
-        df_minus.to_pickle('TEST/FD/df_eps_minus.pkl')
-
-        # Plus ensemble
-        inputs_plus = [{'log_permx': log_perm_plus[:, i]} for i in range(nc)]
-        out_plus = simulator(inputs_plus)
-        df_plus = PETDataFrame.merge_dataframes(out_plus)
-        df_plus.to_pickle('TEST/FD/df_eps_plus.pkl')
+def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST/FINITE_DIFF'):
     
+    datapoint = 'WOPR:PRO2'
+    date = datetime(2032, 12, 14)
+    options = {
+        'parallel': 50,
+        'datatype': [datapoint],
+        'reporttype': 'dates',
+        'reportpoint': [date],
+        'runfile': 'RUNFILE.mako',
+        'startdate': datetime(2022, 1, 1),
+        'adjoint_pbar': False,
+        'adjoints': {'WOPR': 
+            {'steps': [date], 'wellID': 'PRO2', 'parameters': 'permx'}
+        },
+    }
 
-    # ------------------------
-    # ADJOINT
-    # ------------------------
-    if calc_adjoint:
-        simulator = JutulDarcy(kwargs)
-        _, adjoint = simulator({'log_permx': log_permx})
-        adj_df = PETDataFrame.from_pandas(adjoint)
-        adj_df.to_pickle('TEST/FD/adj_df.pkl')
+    os.makedirs(folder, exist_ok=True)
 
+    # Load PERMX 
+    permx = np.load('PERMX.npy')
+
+    reps = 0.01 # Relevant perturbation size for finite difference approximation (1%)
+    if run_fda: 
+        # Calculate finite difference gradient
+        kw = dict(options)
+        kw.pop('adjoints')
+
+        # Pertubed input
+        permx_p = np.tile(permx[:, None], (1, permx.size))
+        permx_m = np.tile(permx[:, None], (1, permx.size))
+        for i in range(permx.size):
+            permx_p[i, i] += reps*permx[i]
+            permx_m[i, i] -= reps*permx[i]
+
+        # Run simulator on perturbed inputs
+        simulator = JutulDarcy(kw)
+        inputs_p  = [{'log_permx': np.log(permx_p[:, i])} for i in range(permx.size)]
+        inputs_m  = [{'log_permx': np.log(permx_m[:, i])} for i in range(permx.size)]
+        results_p = simulator(inputs_p)
+        results_m = simulator(inputs_m)
+
+        # Convert results to PETDataFrame and save
+        results_p = PETDataFrame.merge_dataframes(results_p)
+        results_m = PETDataFrame.merge_dataframes(results_m)
+        results_p.to_pickle(os.path.join(folder, 'results_p.pkl'))
+        results_m.to_pickle(os.path.join(folder, 'results_m.pkl'))
     
-    col = f'WOPR:{kwargs["adjoints"]["WOPR"]["wellID"]}'
-    idx = kwargs['adjoints']['WOPR']['steps'][0]
+    if run_adjoint:
+        # Run simulator with adjoint to get gradient
+        simulator = JutulDarcy(options)
+        inputs = [{'log_permx': np.log(permx)}]
+        results, adjoint = simulator(inputs)
+        adjoint.to_pickle(os.path.join(folder, 'adjoint.pkl'))
+    
+    # Analyze results
+    results_p = PETDataFrame.from_pickle(os.path.join(folder, 'results_p.pkl')).loc[date, datapoint]
+    results_m = PETDataFrame.from_pickle(os.path.join(folder, 'results_m.pkl')).loc[date, datapoint]
+    grad_fda = (results_p - results_m)/(2*reps*permx)
+    grad_adj = PETDataFrame.from_pickle(os.path.join(folder, 'adjoint.pkl')).loc[date, (datapoint, 'permx')]
 
-    df_minus = PETDataFrame.from_pickle('TEST/FD/df_eps_minus.pkl')
-    df_plus = PETDataFrame.from_pickle('TEST/FD/df_eps_plus.pkl')
-    df_minus.is_ensemble = True
-    df_plus.is_ensemble = True
+    relative_error = np.linalg.norm(grad_fda - grad_adj)/np.linalg.norm(grad_fda)
+    print(f"Relative error: {relative_error:.4e}")
+    print(f"Norm of FDA gradient: {np.linalg.norm(grad_fda):.4e}")
+    print(f"Norm of adjoint gradient: {np.linalg.norm(grad_adj):.4e}")
 
-    grad_fd_df = (df_plus - df_minus)/(2*eps)
-    grad_fd = grad_fd_df.loc[idx][col]
-    grad_fd = np.asarray(grad_fd)[:nc]
+    # Plot FDA vs adjoint gradient on grid
+    nx = 10
+    ny = 10
+    nz = 2
+    grad_fda_grid = grad_fda.reshape((nx, ny, nz), order='F')
+    grad_adj_grid = grad_adj.reshape((nx, ny, nz), order='F')
 
-    adj_df = PETDataFrame.from_pickle('TEST/FD/adj_df.pkl')
-    grad_adj = np.asarray(adj_df.loc[idx][(col, 'log_permx')])[:nc]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8), dpi=140)
+    cmap = 'YlGnBu_r'
 
-    print("Finite-difference gradient:", grad_fd)
-    print("Adjoint gradient:", grad_adj)
-    print("Relative difference:", np.linalg.norm(grad_fd - grad_adj) / np.linalg.norm(grad_fd))
+    # im0: Finite difference gradient for layer 1
+    im0 = axes[0, 0].imshow(grad_fda_grid[:, :, 0], cmap=cmap)
+    axes[0, 0].set_title('FDA Gradient (Layer 1)', fontsize=11)
+    fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    # im1: Adjoint gradient for layer 1
+    im1 = axes[0, 1].imshow(grad_adj_grid[:, :, 0], cmap=cmap)
+    axes[0, 1].set_title('Adjoint Gradient (Layer 1)', fontsize=11)
+    fig.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+    # im2: Finite difference gradient for layer 2
+    im2 = axes[1, 0].imshow(grad_fda_grid[:, :, 1], cmap=cmap)
+    axes[1, 0].set_title('FDA Gradient (Layer 2)', fontsize=11)
+    fig.colorbar(im2, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    # im3: Adjoint gradient for layer 2
+    im3 = axes[1, 1].imshow(grad_adj_grid[:, :, 1], cmap=cmap)
+    axes[1, 1].set_title('Adjoint Gradient (Layer 2)', fontsize=11)
+    fig.colorbar(im3, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+    for ax in axes.flatten():
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    fig.tight_layout()
+    fig.savefig(os.path.join(folder, 'fda_vs_adjoint_gradient.png'), dpi=300)
+    #plt.show()
 
 
-def test_sens_matrix(run=True):
+def test_sens_matrix_of_log_permx(run=True, folder='TEST'):
 
-    os.makedirs('TEST/SENS_MATRIX', exist_ok=True)
+    datapoint = 'WOPR:PRO2'
+    date = datetime(2032, 12, 14)
+    options = {
+        'parallel': 50,
+        'datatype': [datapoint],
+        'reporttype': 'dates',
+        'reportpoint': [date],
+        'runfile': 'RUNFILE.mako',
+        'startdate': datetime(2022, 1, 1),
+        'adjoint_pbar': False,
+        'adjoints': {'WOPR': 
+            {'steps': [date], 'wellID': 'PRO2', 'parameters': 'log_permx'}
+        },
+    }
+
+    os.makedirs(folder, exist_ok=True)
 
     ne = 10_000
     if run: 
@@ -125,30 +148,30 @@ def test_sens_matrix(run=True):
         }
         prior_log_permx_ensemble = PETStateArray.generate_from_prior_info(
             prior_info = {'log_permx': pinfo},
-            ne=ne
+            ne=ne,
+            save=False
         )
-        np.save('TEST/SENS_MATRIX/prior_log_permx_ensemble.npy', prior_log_permx_ensemble.data)
+        np.save(os.path.join(folder, 'prior_log_permx_ensemble.npy'), prior_log_permx_ensemble)
 
         # Run simulator on ensemble
-        simulator = JutulDarcy(kwargs)
+        simulator = JutulDarcy(options)
         inputs = [{'log_permx': prior_log_permx_ensemble[:, i]} for i in range(ne)]
         results, adjoint = simulator(inputs)
         results = PETDataFrame.merge_dataframes(results)
         adjoint = PETDataFrame.merge_dataframes(adjoint)
-        print(results)
-        results.to_pickle('TEST/SENS_MATRIX/results.pkl')
-        adjoint.to_pickle('TEST/SENS_MATRIX/adjoint.pkl')
+        results.to_pickle(os.path.join(folder, 'results.pkl'))
+        adjoint.to_pickle(os.path.join(folder, 'adjoint.pkl'))
 
     
     # Analyze results
-    col = f'WOPR:{kwargs["adjoints"]["WOPR"]["wellID"]}'
-    idx = kwargs['adjoints']['WOPR']['steps'][0]
-    results = PETDataFrame.from_pickle('TEST/SENS_MATRIX/results.pkl').loc[idx, col]
-    adjoint = PETDataFrame.from_pickle('TEST/SENS_MATRIX/adjoint.pkl').loc[idx, (col, 'log_permx')]
+    col = datapoint
+    idx = date
+    results = PETDataFrame.from_pickle(os.path.join(folder, 'results.pkl')).loc[idx, col]
+    adjoint = PETDataFrame.from_pickle(os.path.join(folder, 'adjoint.pkl')).loc[idx, (col, 'log_permx')]
 
     nx = 200
     ny = 1
-    enX = np.load('TEST/SENS_MATRIX/prior_log_permx_ensemble.npy')
+    enX = np.load(os.path.join(folder, 'prior_log_permx_ensemble.npy'))
     enY = results[np.newaxis, :]
     enG = adjoint[np.newaxis, :, :]
 
@@ -165,16 +188,16 @@ def test_sens_matrix(run=True):
     Cyx = Y @ A.T
     GbarCxx = Gbar @ A @ A.T
 
-
+    # -------------------------------------------------------------------
     # Stein's lemma tells us that:
     # E[G]Cxx = Cyx   --->   Gbar @ A @ A.T ≈ Y @ A.T (for large ne)
+    # -------------------------------------------------------------------
 
-
-    # Plotting
-    err = []
-    ens = np.logspace(1, np.log10(ne), num=15, dtype=int)
+    # Loop over different ensemble sizes and compute norms of Cyx, GbarCxx, and their difference
     Cxy_norm = []
     GbarCxx_norm = []
+    err = []
+    ens = np.logspace(1, np.log10(ne), num=10, dtype=int)
     for n in ens:
         P_n = (np.eye(n) - np.ones((n,n))/n)/np.sqrt(n-1)
         A_n = enX[:, :n] @ P_n
@@ -184,8 +207,7 @@ def test_sens_matrix(run=True):
         GbarCxx_n = Gbar_n @ A_n @ A_n.T
         Cyx_n = Y_n @ A_n.T
 
-
-        err.append(np.linalg.norm(GbarCxx_n-Cyx))
+        err.append(np.linalg.norm(GbarCxx_n-Cyx_n))
         Cxy_norm.append(np.linalg.norm(Cyx_n))
         GbarCxx_norm.append(np.linalg.norm(GbarCxx_n))
         
@@ -241,12 +263,11 @@ def test_sens_matrix(run=True):
 
     ax.legend(loc='best', frameon=True, fancybox=True, framealpha=0.92)
     fig.tight_layout()
-    plt.show()
-        
-
+    fig.savefig(os.path.join(folder, 'sensitivity_matrix_convergence.png'), dpi=300)
+    #plt.show()
     
 
 
 if __name__ == "__main__":
-    #test_finit_diff(calc_finite_diff=False, calc_adjoint=True)
-    test_sens_matrix(run=False)
+    test_finite_difference_gradient(run_fda=False, run_adjoint=False, folder='TEST/FINITE_DIFF')
+    #test_sens_matrix_of_log_permx(run=True, folder='TEST/SENS_WOPR_LOG_PERMX_SUBSTATES')
