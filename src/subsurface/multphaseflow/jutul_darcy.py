@@ -269,9 +269,8 @@ class JutulDarcy:
         if self.compute_adjoints:
 
             # Initialize adjoint results storage
-            info = self.adjoint_info
-            columns = info.keys()
-            grad_dict = {(col, param): [] for col in columns for param in info[col]['parameters']}
+            columns = self.adjoint_info.keys()
+            grad_dict = {(col, param): [] for col in columns for param in self.adjoint_info[col]['parameters']}
 
             if self.eval_adjoint_funcs:
                 func_dict = {col: [] for col in columns} # For storing functions for each objective
@@ -296,13 +295,13 @@ class JutulDarcy:
             # Loop over adjoint objectives
             for col, info in pbar:
 
-                if info['steps'] == 'all': # If 'all', use same steps as forward simulation results
+                if info['steps'] == 'all': # If 'all', use same steps as in report points
                     adjoint_index = self.index[1]
                     adjoint_seconds = self.report_seconds
                 else:
                     # DAYS
                     if isinstance(info['steps'][0], int):
-                        adjoint_seconds = np.array(info['steps'], dtype=np.int64) * (24*60*60)
+                        adjoint_seconds = np.array(info['steps'], dtype=np.int64) * SECONDS_PER_DAY
                         adjoint_index = info['steps']
 
                     # DATES
@@ -310,7 +309,7 @@ class JutulDarcy:
                         adjoint_seconds = np.array([(d - self.start_date).total_seconds() for d in info['steps']], dtype=np.int64)
                         adjoint_index = info['steps']
 
-                # Map each target time to its 1-based report step index in jlres
+                # Map each time in adjoint_seconds to the closest step in the simulation output (jlres.time)
                 adjoint_step_idx = [int(np.argmin(np.abs(np.array(jlres.time) - s))) + 1 for s in adjoint_seconds]
 
                 # Get QOI function for this objective
@@ -328,7 +327,7 @@ class JutulDarcy:
                     update_desc = f'Adjoints for {col}'
                     pbar.set_description_str(update_desc)
 
-                # Comute adjoint sensitivities
+                # Compute adjoint sensitivities
                 julia.case = case
                 julia.res = jlres
                 for i, func in enumerate(funcs):
@@ -362,14 +361,7 @@ class JutulDarcy:
 
                     # Extract parameter sensitivities for this objective and store in dict
                     for param in info['parameters']:
-                        grad_param = _extract_adjoint(
-                            grad, 
-                            case, 
-                            param, 
-                            actnum_vec, 
-                            info['is_rate'], 
-                            julia
-                        )
+                        grad_param = _extract_adjoint(grad, case, param, actnum_vec, info['is_rate'], julia)
                         grad_dict[(col, param)].append(grad_param)
 
             if self.adjoint_pbar:

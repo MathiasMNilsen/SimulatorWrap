@@ -269,5 +269,5 @@ def test_sens_matrix_of_log_permx(run=True, folder='TEST'):
 
 
 if __name__ == "__main__":
-    test_finite_difference_gradient(run_fda=False, run_adjoint=False, folder='TEST/FINITE_DIFF')
+    test_finite_difference_gradient(run_fda=False, run_adjoint=True, folder='TEST/TEMP')
     #test_sens_matrix_of_log_permx(run=True, folder='TEST/SENS_WOPR_LOG_PERMX_SUBSTATES')
