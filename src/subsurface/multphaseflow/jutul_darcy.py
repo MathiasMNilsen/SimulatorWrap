@@ -85,6 +85,13 @@ class JutulDarcy:
 
             - ``parallel`` : int, optional
                 Number of processes for ensemble simulations. Default is ``1``.
+
+            - ``perm_copied`` : bool, optional
+                If ``True``, interpret sensitivity to ``permx`` as a copied
+                parameterization where ``PERMY`` and ``PERMZ`` are derived from
+                ``PERMX`` (for example via ECLIPSE ``COPY``). This makes
+                ``dJ/dPERMX`` include contributions from all copied directions.
+                Default is ``False``.
         """
         # Check runfile
         runfile = options.get('runfile')
@@ -116,8 +123,15 @@ class JutulDarcy:
 
         # Other options
         self.output_format = options.get('output_format', 'dataframe') # list, dict or dataframe
-        self.adjoint_pbar = options.get('adjoint_pbar', True)
+        self.adjoint_pbar = options.get('adjoint_pbar', False)
         self.parallel = options.get('parallel', 1)
+        self.perm_copied = options.get('perm_copied', False)
+        self.adjoint_mode = options.get('adjoint_mode', 'sensitivities').lower()
+        self.optimization_targets = options.get('optimization_targets', None)
+
+        valid_adjoint_modes = {'sensitivities', 'optimization'}
+        if self.adjoint_mode not in valid_adjoint_modes:
+            raise ValueError(f"Invalid adjoint_mode '{self.adjoint_mode}'. Must be one of {sorted(valid_adjoint_modes)}")
 
         # This is for PET to work properly
         self.input_dict = options
@@ -190,6 +204,8 @@ class JutulDarcy:
 
             return results, adjoints
         else:
+            if len(inputs) == 1:
+                outputs = outputs[0]
             return outputs
                      
 
@@ -198,7 +214,7 @@ class JutulDarcy:
         # Import Julia and JutulDarcy (this needs to be done here for multiprocessing to work properly)
         from juliacall import Main as julia
         julia.seval('using JutulDarcy, Jutul')
-        
+
         # Make simulation folder
         folder = f'En_{idn}'
         os.makedirs(folder)
@@ -332,16 +348,27 @@ class JutulDarcy:
                 julia.res = jlres
                 for i, func in enumerate(funcs):
                     julia.func = func
-                    grad = julia.seval("""
-                    redirect_stdout(devnull) do
-                        redirect_stderr(devnull) do
-                            JutulDarcy.reservoir_sensitivities(
-                                case, res, func,
-                                include_parameters=true,           
-                            )
+                    if self.adjoint_mode == 'sensitivities':
+                        grad = julia.seval("""
+                        redirect_stdout(devnull) do
+                            redirect_stderr(devnull) do
+                                JutulDarcy.reservoir_sensitivities(
+                                    case, res, func,
+                                    include_parameters=true
+                                )
+                            end
                         end
-                    end
-                    """)
+                        """)
+                    else:
+                        grad = julia.seval("""
+                        redirect_stdout(devnull) do
+                            redirect_stderr(devnull) do
+                                dprm_case = JutulDarcy.setup_reservoir_dict_optimization(case, verbose = false)
+                                JutulDarcy.free_optimization_parameters!(dprm_case)
+                                JutulDarcy.parameters_gradient_reservoir(dprm_case, func, deps=:case)
+                            end
+                        end
+                        """)
 
                     # Evaluate function value for this objective at this time step and store in dict (for checking)
                     func_val = None
@@ -361,7 +388,7 @@ class JutulDarcy:
 
                     # Extract parameter sensitivities for this objective and store in dict
                     for param in info['parameters']:
-                        grad_param = _extract_adjoint(grad, case, param, actnum_vec, info['is_rate'], julia)
+                        grad_param = _extract_adjoint(grad, case, param, actnum_vec, self.perm_copied, julia)
                         grad_dict[(col, param)].append(grad_param)
 
             if self.adjoint_pbar:
@@ -469,31 +496,92 @@ class JutulDarcy:
 
 
                
-def _extract_adjoint(jlgrad, jlcase, parameter, actnum, is_rate, julia):
-     
-    if 'poro' in parameter.lower():
-        adjoint = np.asarray(jlgrad[julia.Symbol("porosity")]) # F-order array (only active cells)
+def _extract_adjoint(jlgrad, jlcase, parameter, actnum, perm_copied, julia):
+    param_lower = parameter.lower()
+
+    if 'poro' in param_lower:
+        poro_grad = _find_nested_entry(jlgrad, ['porosity'], julia)
+        if poro_grad is None:
+            raise ValueError(f"Could not find porosity gradient for parameter '{parameter}'")
+        adjoint = np.asarray(poro_grad)
         adjoint = _active_to_full_grid(adjoint, actnum)
+    
+    elif 'perm' in param_lower:
+        log_scale = 'log' in param_lower
+        perm_grad = _find_nested_entry(jlgrad, ['permeability'], julia)
 
-    elif 'perm' in parameter.lower():
-        adjoint = np.asarray(jlgrad[julia.Symbol("permeability")]) # F-order array (only active cells)
+        if perm_grad is None:
+            raise ValueError(f"Could not find permeability gradient for parameter '{parameter}'")
         
-        if 'permx' in parameter.lower(): index = 0
-        if 'permy' in parameter.lower(): index = 1
-        if 'permz' in parameter.lower(): index = 2
-        
-        adjoint = _active_to_full_grid(adjoint[index], actnum) # SI: per m2, convert to per mD
-
-        if 'log' in parameter.lower():
-            perm = np.array(jlcase.input_data['GRID'][['PERMX', 'PERMY', 'PERMZ'][index]])
-            adjoint = adjoint * perm.flatten(order='F')
-            # Note: For dJ/dlog(perm) = dJ/dperm * perm, no need to convert from m2 to mD.
+        full_adjoint = np.asarray(perm_grad)
+        if perm_copied:
+            adjoint = np.zeros(actnum.shape, dtype=np.float64)
+            for i in range(3):
+                adj = _active_to_full_grid(full_adjoint[i], actnum)
+                if log_scale:
+                    perm = np.array(jlcase.input_data['GRID'][['PERMX', 'PERMY', 'PERMZ'][i]])
+                    adj = adj * perm.flatten(order='F')
+                else:
+                    adj = adj * julia.seval('si_unit(:milli)*si_unit(:darcy)')
+                adjoint += adj
         else:
-            adjoint = adjoint * julia.seval('si_unit(:milli)*si_unit(:darcy)')
+            perm_idx = {'permx': 0, 'permy': 1, 'permz': 2}
+            idx = next((v for k, v in perm_idx.items() if k in param_lower), None)
+            
+            if idx is None:
+                raise ValueError(f"Adjoint not implemented for parameter '{parameter}'")
+            
+            adjoint = _active_to_full_grid(full_adjoint[idx], actnum)
+            if log_scale:
+                perm = np.array(jlcase.input_data['GRID'][['PERMX', 'PERMY', 'PERMZ'][idx]])
+                adjoint = adjoint * perm.flatten(order='F')
+            else:
+                adjoint = adjoint * julia.seval('si_unit(:milli)*si_unit(:darcy)')
+    
     else:
         raise ValueError(f"Adjoint not implemented for parameter '{parameter}'")
-
+    
     return adjoint
+
+
+def _get_mapping_value(obj, key_name, julia):
+    for candidate in (julia.Symbol(key_name), key_name):
+        try:
+            if julia.haskey(obj, candidate):
+                return obj[candidate]
+        except Exception:
+            continue
+    return None
+
+
+def _find_nested_entry(root, key_candidates, julia):
+    queue = [root]
+    visited = set()
+
+    while queue:
+        obj = queue.pop(0)
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+
+        for key in key_candidates:
+            val = _get_mapping_value(obj, key, julia)
+            if val is not None:
+                return val
+
+        try:
+            for k in list(julia.keys(obj)):
+                try:
+                    sub = obj[k]
+                except Exception:
+                    continue
+                queue.append(sub)
+        except Exception:
+            continue
+
+    return None
+
         
 
 def _active_to_full_grid(vec, actnum_vec, fill_value=0.0):
