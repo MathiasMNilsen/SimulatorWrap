@@ -12,7 +12,7 @@ def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST
     datapoint = 'WOPR:PRO2'
     date = datetime(2032, 12, 14)
     options = {
-        'parallel': 50,
+        'parallel': 5,
         'datatype': [datapoint],
         'reporttype': 'dates',
         'reportpoint': [date],
@@ -20,8 +20,9 @@ def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST
         'startdate': datetime(2022, 1, 1),
         'adjoint_pbar': False,
         'adjoints': {'WOPR': 
-            {'steps': [date], 'wellID': 'PRO2', 'parameters': 'permx'}
+            {'steps': [date], 'wellID': 'PRO2', 'parameters': 'poro'}
         },
+        'perm_copied': True, 
     }
 
     os.makedirs(folder, exist_ok=True)
@@ -29,7 +30,7 @@ def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST
     # Load PERMX 
     permx = np.load('PERMX.npy')
 
-    reps = 0.01 # Relevant perturbation size for finite difference approximation (1%)
+    reps = 0.01 # Relative perturbation size for finite difference approximation (0.5%)
     if run_fda: 
         # Calculate finite difference gradient
         kw = dict(options)
@@ -65,13 +66,8 @@ def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST
     # Analyze results
     results_p = PETDataFrame.from_pickle(os.path.join(folder, 'results_p.pkl')).loc[date, datapoint]
     results_m = PETDataFrame.from_pickle(os.path.join(folder, 'results_m.pkl')).loc[date, datapoint]
-    grad_fda = (results_p - results_m)/(2*reps*permx)
+    grad_fda = (results_p - results_m)/(2*reps*permx)  # Finite difference approximation of gradient
     grad_adj = PETDataFrame.from_pickle(os.path.join(folder, 'adjoint.pkl')).loc[date, (datapoint, 'permx')]
-
-    relative_error = np.linalg.norm(grad_fda - grad_adj)/np.linalg.norm(grad_fda)
-    print(f"Relative error: {relative_error:.4e}")
-    print(f"Norm of FDA gradient: {np.linalg.norm(grad_fda):.4e}")
-    print(f"Norm of adjoint gradient: {np.linalg.norm(grad_adj):.4e}")
 
     # Plot FDA vs adjoint gradient on grid
     nx = 10
@@ -81,25 +77,28 @@ def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST
     grad_adj_grid = grad_adj.reshape((nx, ny, nz), order='F')
 
     fig, axes = plt.subplots(2, 2, figsize=(10, 8), dpi=140)
-    cmap = 'YlGnBu_r'
+    cmap = 'seismic'
 
     # im0: Finite difference gradient for layer 1
-    im0 = axes[0, 0].imshow(grad_fda_grid[:, :, 0], cmap=cmap)
+    maxv = np.max(np.abs(grad_adj_grid[:, :, 0]))
+    im0 = axes[0, 0].imshow(grad_fda_grid[:, :, 0], cmap=cmap, vmin=-maxv, vmax=maxv)
     axes[0, 0].set_title('FDA Gradient (Layer 1)', fontsize=11)
     fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
 
     # im1: Adjoint gradient for layer 1
-    im1 = axes[0, 1].imshow(grad_adj_grid[:, :, 0], cmap=cmap)
+    im1 = axes[0, 1].imshow(grad_adj_grid[:, :, 0], cmap=cmap, vmin=-maxv, vmax=maxv)
     axes[0, 1].set_title('Adjoint Gradient (Layer 1)', fontsize=11)
     fig.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
+
     # im2: Finite difference gradient for layer 2
-    im2 = axes[1, 0].imshow(grad_fda_grid[:, :, 1], cmap=cmap)
+    maxv = np.max(np.abs(grad_adj_grid[:, :, 1]))
+    im2 = axes[1, 0].imshow(grad_fda_grid[:, :, 1], cmap=cmap, vmin=-maxv, vmax=maxv)
     axes[1, 0].set_title('FDA Gradient (Layer 2)', fontsize=11)
     fig.colorbar(im2, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
     # im3: Adjoint gradient for layer 2
-    im3 = axes[1, 1].imshow(grad_adj_grid[:, :, 1], cmap=cmap)
+    im3 = axes[1, 1].imshow(grad_adj_grid[:, :, 1], cmap=cmap, vmin=-maxv, vmax=maxv)
     axes[1, 1].set_title('Adjoint Gradient (Layer 2)', fontsize=11)
     fig.colorbar(im3, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
@@ -111,13 +110,27 @@ def test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST
     fig.savefig(os.path.join(folder, 'fda_vs_adjoint_gradient.png'), dpi=300)
     #plt.show()
 
+    grad_fda_vec = grad_fda_grid.flatten(order='F')
+    grad_adj_vec = grad_adj_grid.flatten(order='F')
+
+    relative_error = np.linalg.norm(grad_fda_vec - grad_adj_vec) / np.linalg.norm(grad_adj_vec)
+    print(f"Relative error between FDA and adjoint gradients: {relative_error:.4e}")
+    print(f"Norm of FDA gradient: {np.linalg.norm(grad_fda_vec):.4e}")
+    print(f"Norm of adjoint gradient: {np.linalg.norm(grad_adj_vec):.4e}")
+
+
+    rtol = grad_adj_vec.size * np.finfo(float).eps * 100  # Relative tolerance scaled by size of gradient vector
+    atol = 1e-2 * np.linalg.norm(grad_adj_vec)  #
+    print(f"Using rtol={rtol:.4e} and atol={atol:.4e} for np.testing.assert_allclose")
+    np.testing.assert_allclose(grad_fda_vec, grad_adj_vec, rtol=rtol, atol=atol)
+
 
 def test_sens_matrix_of_log_permx(run=True, folder='TEST'):
 
     datapoint = 'WOPR:PRO2'
     date = datetime(2032, 12, 14)
     options = {
-        'parallel': 50,
+        'parallel': 5,
         'datatype': [datapoint],
         'reporttype': 'dates',
         'reportpoint': [date],
@@ -269,5 +282,5 @@ def test_sens_matrix_of_log_permx(run=True, folder='TEST'):
 
 
 if __name__ == "__main__":
-    test_finite_difference_gradient(run_fda=False, run_adjoint=True, folder='TEST/TEMP')
+    test_finite_difference_gradient(run_fda=True, run_adjoint=True, folder='TEST/TEMP')
     #test_sens_matrix_of_log_permx(run=True, folder='TEST/SENS_WOPR_LOG_PERMX_SUBSTATES')
