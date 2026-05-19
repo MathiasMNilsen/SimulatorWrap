@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -32,9 +33,9 @@ kwargs = {
     'reporttype': 'dates',
     'reportpoint': datetimes,
     'runfile': 'RUNFILE.mako',
-    'startdate': datetime(2022, 1, 1),
     'datatype': datatype,
     'adjoint_pbar': True,
+    'perm_copied': True, # Include total derivative when PERMX is copied to PERMY and PERMZ
     'adjoints': {'WOPR': 
         {'steps': [datetime(2032, 12, 14)], 'wellID': 'PRO2', 'parameters': ['log_permx', 'permx']},
     },

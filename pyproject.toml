@@ -28,3 +28,12 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/Python-Ensemble-Toolbox/SimulatorWrap"
 Issues = "https://github.com/Python-Ensemble-Toolbox/SimulatorWrap/ issues"
+
+[tool.pytest.ini_options]
+# Suppress the DeprecationWarning from `multiprocess` calling os.fork() in a
+# multi-threaded process (triggered by p_tqdm's parallel worker launch).
+# This is a known limitation of the fork-based multiprocessing backend and
+# does not affect correctness; the warning is harmless in this context.
+filterwarnings = [
+    "ignore::DeprecationWarning:multiprocess",
+]
